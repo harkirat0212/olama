@@ -1,20 +1,21 @@
 # app_streamlit_groq_chroma_hf.py
 """
-Streamlit RAG chatbot (auto-index + OCR fallback + robust Chroma)
-- Groq for text generation (OpenAI-compatible endpoint) if GROQ_API_KEY available
-- Hugging Face Inference for embeddings & image captioning (HF_API_TOKEN required)
-- Chroma for vector store; robust constructor with persistent attempt and in-memory fallback
-- Auto-index uploaded files once per fingerprint
-- OCR fallback (pdf2image + pytesseract) if available (requires poppler + tesseract)
-Security: This example contains embedded fallback keys (if provided). Prefer setting HF_API_TOKEN and GROQ_API_KEY
-in Streamlit Secrets or environment variables for production.
+Streamlit RAG chatbot — updated resilient embeddings flow.
+
+Features:
+- Embeddings backend selector: "HF Inference API" (default) or "Local sentence-transformers"
+- HF embeddings tries multiple candidate models and uses huggingface_hub.InferenceClient if available
+- If HF fails, optionally fall back to local sentence-transformers (if installed)
+- Robust Chroma client (tries multiple constructors, falls back to in-memory)
+- OCR fallback for scanned PDFs using pdf2image + pytesseract if available
+- Groq (OpenAI-compatible) for generation if GROQ key is present; HF text model fallback
 """
 
 import os
 import hashlib
 import tempfile
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Iterable
 
 import requests
 import streamlit as st
@@ -30,9 +31,23 @@ try:
 except Exception:
     OCR_AVAILABLE = False
 
+# optional local embeddings
+try:
+    from sentence_transformers import SentenceTransformer
+    LOCAL_S2_AVAILABLE = True
+except Exception:
+    LOCAL_S2_AVAILABLE = False
+
+# optional HF client
+try:
+    from huggingface_hub import InferenceClient
+    HF_HUB_AVAILABLE = True
+except Exception:
+    HF_HUB_AVAILABLE = False
+
 # -------------------------
 # USER KEYS (FALLBACKS)
-# Replace or remove these hardcoded fallbacks before public release.
+# -------------------------
 GROQ_KEY_FALLBACK = "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"
 HF_KEY_FALLBACK = "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"
 # -------------------------
@@ -40,12 +55,15 @@ HF_KEY_FALLBACK = "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"
 # -------------------------
 # CONFIG
 # -------------------------
-DEFAULT_HF_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_HF_EMBED_MODELS = [
+    "intfloat/e5-small",                      # often supported for HF inference embeddings
+    "sentence-transformers/all-MiniLM-L6-v2", # widely used
+    "sentence-transformers/all-mpnet-base-v2" # higher quality
+]
 DEFAULT_HF_IMAGE_MODEL = "Salesforce/blip-image-captioning-large"
 DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 
-# Use a new persist folder name to avoid reusing older DBs
-TMP_DIR = Path(os.environ.get("STREAMLIT_CHROMA_DIR", tempfile.gettempdir())) / "chroma_persist_v3"
+TMP_DIR = Path(os.environ.get("STREAMLIT_CHROMA_DIR", tempfile.gettempdir())) / "chroma_persist_v4"
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_UPLOADS = 6
@@ -55,10 +73,10 @@ CHUNK_OVERLAP = 200
 HF_BATCH_SIZE = 16
 HF_TIMEOUT = 60
 
-st.set_page_config(page_title="RAG — Groq + HF + Chroma (Auto-index)", layout="wide")
+st.set_page_config(page_title="RAG — Resilient Embeddings + Chroma", layout="wide")
 
 # -------------------------
-# Helpers: secrets, HF clients
+# helpers: secrets
 # -------------------------
 def get_hf_token() -> str:
     token = os.environ.get("HF_API_TOKEN")
@@ -84,85 +102,46 @@ def get_groq_key() -> str:
         pass
     return GROQ_KEY_FALLBACK
 
-# class HFInferenceEmbeddings:
-#     def __init__(self, model: str = DEFAULT_HF_EMBED_MODEL, timeout: int = HF_TIMEOUT):
-#         token = get_hf_token()
-#         if not token:
-#             raise RuntimeError("HF API token not set (HF_API_TOKEN).")
-#         self.url = f"https://api-inference.huggingface.co/embeddings/{model}"
-#         self.headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-#         self.timeout = timeout
-
-#     def _post(self, inputs: List[str]):
-#         payload = {"inputs": inputs}
-#         r = requests.post(self.url, headers=self.headers, json=payload, timeout=self.timeout)
-#         r.raise_for_status()
-#         return r.json()
-
-#     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-#         out = []
-#         for i in range(0, len(texts), HF_BATCH_SIZE):
-#             batch = texts[i : i + HF_BATCH_SIZE]
-#             out_batch = self._post(batch)
-#             out.extend(out_batch)
-#         return out
-
-#     def embed_query(self, text: str) -> List[float]:
-#         return self._post([text])[0]
-
-from typing import Iterable
-
-class HFInferenceEmbeddings:
+# -------------------------
+# Robust HF embeddings (tries many routes) + local fallback
+# -------------------------
+class HFAndLocalEmbeddings:
     """
-    Robust HF embeddings helper:
-     - Attempts multiple inference endpoints (embeddings, pipeline/feature-extraction)
-     - Falls back to huggingface_hub.InferenceClient if installed
-     - Batches requests and returns a list of vectors
+    Attempts:
+      1) huggingface_hub.InferenceClient.embeddings() (if huggingface_hub available)
+      2) HF inference endpoints (embeddings / feature-extraction) for a list of candidate models
+      3) Local sentence-transformers model (if installed/allowed)
     """
-    def __init__(self, model: str = DEFAULT_HF_EMBED_MODEL, timeout: int = HF_TIMEOUT):
-        self.model = model
+
+    def __init__(self, candidate_models: List[str], use_local_if_failed: bool = True, timeout: int = HF_TIMEOUT):
+        self.candidate_models = candidate_models
         self.timeout = timeout
         self.token = get_hf_token()
-        if not self.token:
-            raise RuntimeError("HF API token not set (HF_API_TOKEN).")
-
-        # Candidate endpoints to try (ordered)
-        self.endpoints = [
-            f"https://api-inference.huggingface.co/embeddings/{model}",
-            f"https://api-inference.huggingface.co/pipeline/feature-extraction/{model}",
-            f"https://api-inference.huggingface.co/models/{model}/pipeline/feature-extraction",
-            f"https://api-inference.huggingface.co/models/{model}",  # last resort (may not return embeddings)
-        ]
-        self.headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
-        # Try to instantiate huggingface_hub InferenceClient if available (best fallback)
+        self.use_local_if_failed = use_local_if_failed
         self.hf_client = None
-        try:
-            from huggingface_hub import InferenceClient
-            self.hf_client = InferenceClient(self.token)
-        except Exception:
-            self.hf_client = None
+        if HF_HUB_AVAILABLE:
+            try:
+                self.hf_client = InferenceClient(token=self.token)
+            except Exception:
+                self.hf_client = None
 
-    def _try_request(self, url: str, inputs: Iterable[str]):
-        """POST to HF inference endpoint and return JSON or raise."""
-        payload = {"inputs": list(inputs)}
-        resp = requests.post(url, headers=self.headers, json=payload, timeout=self.timeout)
-        resp.raise_for_status()
-        return resp.json()
+        # prepare HTTP endpoints templates
+        self.endpoint_templates = [
+            "https://api-inference.huggingface.co/embeddings/{model}",
+            "https://api-inference.huggingface.co/pipeline/feature-extraction/{model}",
+            "https://api-inference.huggingface.co/models/{model}/pipeline/feature-extraction",
+            "https://api-inference.huggingface.co/models/{model}"
+        ]
+        self.headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"} if self.token else {}
+
+        # local model attr (lazy)
+        self.local_model = None
 
     def _normalize_response(self, resp):
-        """
-        Normalize response to list-of-vectors shape.
-        Many HF endpoints return:
-         - list[list[float]]  (good)
-         - {"error": "..."}   (bad)
-         - list[{"embedding": [...]}] (rare)
-        """
         if resp is None:
             return None
-        # If already list of lists of floats
         if isinstance(resp, list) and resp and all(isinstance(x, list) for x in resp):
             return resp
-        # If list of dicts with 'embedding' or 'vector' keys
         if isinstance(resp, list) and resp and all(isinstance(x, dict) for x in resp):
             out = []
             for item in resp:
@@ -170,92 +149,137 @@ class HFInferenceEmbeddings:
                     out.append(item["embedding"])
                 elif "vector" in item:
                     out.append(item["vector"])
-                elif "generated_text" in item and isinstance(item["generated_text"], list):
-                    out.append(item["generated_text"])
                 else:
-                    # can't normalize this item
-                    return None
+                    # some endpoints may return nested lists in dict; attempt extraction
+                    # try to find first list-of-floats in dict values
+                    found = None
+                    for v in item.values():
+                        if isinstance(v, list) and all(isinstance(x, float) or isinstance(x, int) for x in v):
+                            found = v
+                            break
+                    if found:
+                        out.append(found)
+                    else:
+                        return None
             return out
-        # If single dict with embeddings keyed, try to extract
         if isinstance(resp, dict):
-            # Some pipeline outputs might be nested
-            if "error" in resp:
-                raise RuntimeError(f"Hugging Face error: {resp.get('error')}")
-            # attempt to find embeddings key
-            for k in ("embedding", "embeddings", "vector", "vectors"):
+            # attempt to extract embeddings list
+            for k in ("embedding","embeddings","vector","vectors"):
                 if k in resp:
-                    v = resp[k]
-                    if isinstance(v, list) and all(isinstance(x, list) for x in v):
-                        return v
-            # otherwise can't normalize
+                    val = resp[k]
+                    if isinstance(val, list) and all(isinstance(x, list) for x in val):
+                        return val
             return None
         return None
 
-    def _call_hf_client(self, inputs: Iterable[str]):
-        """Use huggingface_hub.InferenceClient if available (preferred)."""
+    def _call_hf_client(self, model: str, inputs: Iterable[str]):
         if not self.hf_client:
             return None
         try:
-            out = self.hf_client.embeddings(model=self.model, inputs=list(inputs))
-            # InferenceClient.embeddings returns list-of-vectors for list input
-            return out
-        except Exception as e:
-            # try InferenceClient.__call__ fallback (pipeline)
+            return self.hf_client.embeddings(model=model, inputs=list(inputs))
+        except Exception:
             try:
-                resp = self.hf_client(inputs=list(inputs), model=self.model)
-                norm = self._normalize_response(resp)
-                return norm
+                # fallback to direct call
+                res = self.hf_client(list(inputs), model=model)
+                return self._normalize_response(res)
             except Exception:
                 return None
 
-    def _request_try_endpoints(self, inputs: Iterable[str]):
-        # First try huggingface_hub client if available
-        if self.hf_client:
+    def _http_try(self, model: str, inputs: Iterable[str]):
+        for templ in self.endpoint_templates:
+            url = templ.format(model=model)
             try:
-                out = self._call_hf_client(inputs)
-                if out:
-                    return out
-            except Exception:
-                pass
-
-        # Then try HTTP endpoints in order
-        for url in self.endpoints:
-            try:
-                resp = self._try_request(url, inputs)
-                norm = self._normalize_response(resp)
+                data = {"inputs": list(inputs)}
+                r = requests.post(url, headers=self.headers, json=data, timeout=self.timeout)
+                if r.status_code == 404 or r.status_code == 410 or r.status_code == 403:
+                    # unsupported endpoint/model — try next
+                    continue
+                r.raise_for_status()
+                jsonr = r.json()
+                norm = self._normalize_response(jsonr)
                 if norm:
                     return norm
-                # if normalization failed but endpoint returned something, still continue to next endpoint
+                # if not normalized, continue to try next endpoint
             except requests.HTTPError as he:
                 status = getattr(he.response, "status_code", None)
-                # try next endpoint for 410/404 etc.
-                if status in (410, 404, 403):
+                if status in (404, 410, 403):
                     continue
-                # re-raise other HTTP errors so they become visible
-                raise
+                else:
+                    # re-raise other HTTP errors so they are visible
+                    raise
             except Exception:
-                # try next endpoint
                 continue
-        # all endpoints failed
-        raise RuntimeError("All HF inference endpoints failed or returned unexpected formats for embeddings.")
+        return None
+
+    def _try_models_hf(self, inputs: Iterable[str]):
+        # Try HF client first with each model
+        for model in self.candidate_models:
+            try:
+                if self.hf_client:
+                    out = self._call_hf_client(model, inputs)
+                    if out:
+                        st.info(f"HF InferenceClient succeeded with model {model}")
+                        return out, model
+            except Exception as e:
+                # continue to next model
+                st.info(f"HF client try failed for model {model}: {e}")
+
+            # Try raw HTTP endpoints for that model
+            try:
+                out = self._http_try(model, inputs)
+                if out:
+                    st.info(f"HF HTTP endpoint succeeded with model {model}")
+                    return out, model
+            except Exception as e:
+                st.info(f"HF HTTP try failed for model {model}: {e}")
+                continue
+        return None, None
+
+    def _init_local_model(self):
+        if not LOCAL_S2_AVAILABLE:
+            raise RuntimeError("Local sentence-transformers not installed.")
+        if self.local_model is None:
+            # choose a small local model to reduce download size; fallback to all-MiniLM-L6-v2 if available
+            try:
+                self.local_model = SentenceTransformer("all-MiniLM-L6-v2")
+            except Exception:
+                # try a more explicit HF model id
+                self.local_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        return self.local_model
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        # Batch
-        out = []
-        for i in range(0, len(texts), HF_BATCH_SIZE):
-            batch = texts[i : i + HF_BATCH_SIZE]
-            res = self._request_try_endpoints(batch)
-            if res is None:
-                raise RuntimeError("Failed to get embeddings for batch.")
-            out.extend(res)
-        return out
+        # First try HF model(s)
+        try:
+            out, used_model = self._try_models_hf(texts)
+            if out:
+                return out
+        except Exception as e:
+            st.info(f"HF model attempts raised error: {e}")
+
+        # HF failed: fallback to local if allowed
+        if self.use_local_if_failed:
+            if LOCAL_S2_AVAILABLE:
+                st.info("Falling back to local sentence-transformers embeddings (this may download a model on first run).")
+                try:
+                    model = self._init_local_model()
+                    vecs = model.encode(texts, show_progress_bar=False, batch_size=HF_BATCH_SIZE, convert_to_numpy=True)
+                    return [v.tolist() for v in vecs]
+                except Exception as e:
+                    raise RuntimeError(f"Local sentence-transformers embedding failed: {e}")
+            else:
+                raise RuntimeError("HF inference failed and local sentence-transformers not available.")
+        else:
+            raise RuntimeError("HF inference failed and local fallback disabled.")
 
     def embed_query(self, text: str) -> List[float]:
-        res = self._request_try_endpoints([text])
+        res = self.embed_documents([text])
         if not res or not isinstance(res, list):
-            raise RuntimeError("Failed to compute query embedding.")
+            raise RuntimeError("Failed to produce query embedding.")
         return res[0]
 
+# -------------------------
+# Groq & HF image caption (unchanged)
+# -------------------------
 class HFImageCaption:
     def __init__(self, model: str = DEFAULT_HF_IMAGE_MODEL, timeout: int = HF_TIMEOUT):
         token = get_hf_token()
@@ -276,9 +300,6 @@ class HFImageCaption:
             return out["generated_text"]
         return str(out)
 
-# -------------------------
-# Groq client (OpenAI-compatible)
-# -------------------------
 class GroqClient:
     ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
     def __init__(self, api_key: Optional[str] = None, timeout: int = 60):
@@ -304,7 +325,7 @@ class GroqClient:
             return str(res)
 
 # -------------------------
-# file fingerprinting, chunking, OCR
+# File helpers, OCR, chunking (unchanged)
 # -------------------------
 def fingerprint_files(files: List[st.runtime.uploaded_file_manager.UploadedFile]) -> str:
     h = hashlib.sha256()
@@ -353,13 +374,9 @@ def ocr_pdf_to_text_bytes(pdf_path: Path) -> str:
             return ""
 
 # -------------------------
-# Robust Chroma client + collection helpers
+# Robust Chroma client + ensure_collection (unchanged)
 # -------------------------
 def chroma_client(persist_directory: str) -> chromadb.Client:
-    """
-    Try multiple Settings signatures to support different chromadb versions.
-    Fall back to an in-memory client if persistent options fail.
-    """
     persist_directory = str(persist_directory)
     tried = []
     candidates = [
@@ -373,7 +390,6 @@ def chroma_client(persist_directory: str) -> chromadb.Client:
         try:
             settings = Settings(**s)
             client = chromadb.Client(settings)
-            # smoke test
             try:
                 _ = client.list_collections()
             except Exception:
@@ -383,8 +399,6 @@ def chroma_client(persist_directory: str) -> chromadb.Client:
         except Exception as e:
             tried.append((s, str(e)))
             continue
-
-    # fallback to in-memory client
     try:
         st.warning("Persistent Chroma initialization failed; falling back to in-memory Chroma (no persistence).")
         client = chromadb.Client()
@@ -401,7 +415,6 @@ def ensure_collection(client: chromadb.Client, name: str):
         try:
             return client.create_collection(name=name)
         except Exception:
-            # try listing and searching
             try:
                 cols = client.list_collections()
                 for c in cols:
@@ -412,9 +425,9 @@ def ensure_collection(client: chromadb.Client, name: str):
             raise RuntimeError(f"Could not create or get collection '{name}'.")
 
 # -------------------------
-# Indexing & query helpers
+# Index & query code (uses HFAndLocalEmbeddings)
 # -------------------------
-def index_uploaded_files(uploaded_files, hf_embed_model: str, chunk_size: int, chunk_overlap: int, max_chunks: Optional[int]):
+def index_uploaded_files(uploaded_files, embed_backend: str, candidate_models: List[str], hf_embed_model_choice: str, use_local_fallback: bool, chunk_size: int, chunk_overlap: int, max_chunks: Optional[int]):
     if not uploaded_files:
         return None
     fp = fingerprint_files(uploaded_files)
@@ -433,7 +446,6 @@ def index_uploaded_files(uploaded_files, hf_embed_model: str, chunk_size: int, c
         st.error(f"Could not ensure Chroma collection: {e}")
         return None
 
-    # reuse if already indexed
     try:
         cnt = col.count()
         if cnt and cnt > 0:
@@ -466,7 +478,6 @@ def index_uploaded_files(uploaded_files, hf_embed_model: str, chunk_size: int, c
             except Exception as e:
                 st.info(f"pypdf error for {uploaded.name}: {e}")
                 text = ""
-
             if (not text or not text.strip()) and OCR_AVAILABLE:
                 st.info(f"No text via pypdf for {uploaded.name}; trying OCR...")
                 try:
@@ -504,25 +515,22 @@ def index_uploaded_files(uploaded_files, hf_embed_model: str, chunk_size: int, c
         st.info(f"Indexing first {max_chunks} chunks (out of {len(texts)})")
         texts = texts[:max_chunks]; ids = ids[:max_chunks]; metadatas = metadatas[:max_chunks]
 
+    # prepare embeddings helper
+    use_local = (embed_backend == "local") or (embed_backend == "auto" and use_local_fallback)
+    hf_helper = HFAndLocalEmbeddings(candidate_models=candidate_models, use_local_if_failed=use_local)
     try:
-        hf = HFInferenceEmbeddings(model=hf_embed_model)
+        embeddings = []
+        progress = st.progress(0)
+        total = len(texts)
+        for i in range(0, total, HF_BATCH_SIZE):
+            batch = texts[i : i + HF_BATCH_SIZE]
+            ev = hf_helper.embed_documents(batch)
+            embeddings.extend(ev)
+            progress.progress(min(100, int(100 * (i + len(batch)) / total)))
+        progress.empty()
     except Exception as e:
-        st.error(f"HF init error: {e}")
+        st.error(f"HF embedding error: {e}")
         return None
-
-    embeddings = []
-    progress = st.progress(0)
-    total = len(texts)
-    for i in range(0, total, HF_BATCH_SIZE):
-        batch = texts[i : i + HF_BATCH_SIZE]
-        try:
-            ev = hf.embed_documents(batch)
-        except Exception as e:
-            st.error(f"HF embedding error: {e}")
-            return None
-        embeddings.extend(ev)
-        progress.progress(min(100, int(100 * (i + len(batch)) / total)))
-    progress.empty()
 
     try:
         col.add(documents=texts, metadatas=metadatas, ids=ids, embeddings=embeddings)
@@ -533,16 +541,12 @@ def index_uploaded_files(uploaded_files, hf_embed_model: str, chunk_size: int, c
 
     return {"collection": col, "persist_dir": persist_dir, "indexed_chunks": len(texts), "snippets": snippets}
 
-def query_collection(collection: chromadb.api.models.Collection, query: str, hf_embed_model: str, k: int = 3):
+def query_collection(collection: chromadb.api.models.Collection, query: str, candidate_models: List[str], use_local_fallback: bool, k: int = 3):
     if collection is None:
         return []
+    hf_helper = HFAndLocalEmbeddings(candidate_models=candidate_models, use_local_if_failed=use_local_fallback)
     try:
-        hf = HFInferenceEmbeddings(model=hf_embed_model)
-    except Exception as e:
-        st.error(f"HF init error: {e}")
-        return []
-    try:
-        qv = hf.embed_query(query)
+        qv = hf_helper.embed_query(query)
     except Exception as e:
         st.error(f"HF embedding error for query: {e}")
         return []
@@ -560,24 +564,19 @@ def query_collection(collection: chromadb.api.models.Collection, query: str, hf_
     return docs
 
 # -------------------------
-# Simple memory helper
-# -------------------------
-class SimpleMemory:
-    def __init__(self, k: int = 4):
-        self.k = max(1, int(k))
-    def load_memory(self):
-        msgs = st.session_state.get("messages", [])
-        last = msgs[-self.k:] if msgs else []
-        return [{"type": m.get("role","assistant"), "content": m.get("content","")} for m in last]
-
-# -------------------------
-# UI: sidebar & auto-index
+# UI and flow (similar to earlier app)
 # -------------------------
 with st.sidebar:
     st.header("Settings")
-    groq_model = st.text_input("Groq model", value=DEFAULT_GROQ_MODEL)
-    hf_embed_model = st.text_input("HF embed model", value=DEFAULT_HF_EMBED_MODEL)
+    # Embedding backend control
+    embed_backend = st.selectbox("Embeddings backend", ["hf_inference", "local", "auto"], index=2,
+                                help="hf_inference = HuggingFace Inference API only; local = sentence-transformers locally; auto = try HF then local fallback")
+    st.markdown("**HF candidate models (tried in order)**")
+    # show editable list as comma-separated
+    models_txt = st.text_area("HF candidate models (comma separated)", value=",".join(DEFAULT_HF_EMBED_MODELS), height=70)
+    candidate_models = [m.strip() for m in models_txt.split(",") if m.strip()]
     hf_image_model = st.text_input("HF image caption model", value=DEFAULT_HF_IMAGE_MODEL)
+    groq_model = st.text_input("Groq model", value=DEFAULT_GROQ_MODEL)
     chunk_size = st.number_input("Chunk size", value=CHUNK_SIZE, min_value=256)
     chunk_overlap = st.number_input("Chunk overlap", value=CHUNK_OVERLAP, min_value=0)
     max_chunks = st.number_input("Max chunks to index (0=no limit)", value=0, min_value=0)
@@ -589,7 +588,7 @@ with st.sidebar:
     if st.button("Clear conversation & index"):
         for k in ["messages","chroma_info","last_upload_fp"]:
             if k in st.session_state: del st.session_state[k]
-        st.rerun()
+        st.experimental_rerun()
 
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
@@ -603,19 +602,22 @@ try:
 except Exception:
     groq_client = None
 
-st.title("RAG Chat — Groq Llama-3 + HF embeddings + Chroma (Auto-index)")
+st.title("RAG Chat — Resilient Embeddings + Chroma")
 
-# AUTO-INDEX once for a new upload fingerprint
+# Auto-index when uploads detected (single-run per fingerprint)
 if uploaded_files and (st.session_state.get("chroma_info") is None):
     try:
         uploaded_fp = fingerprint_files(uploaded_files)
         prev_fp = st.session_state.get("last_upload_fp")
         if uploaded_fp != prev_fp:
             st.session_state["last_upload_fp"] = uploaded_fp
-            with st.spinner("Auto-indexing uploaded files (HF embeddings → Chroma)..."):
+            with st.spinner("Auto-indexing uploaded files..."):
                 info = index_uploaded_files(
                     uploaded_files=uploaded_files,
-                    hf_embed_model=hf_embed_model,
+                    embed_backend=embed_backend,
+                    candidate_models=candidate_models,
+                    hf_embed_model_choice=candidate_models[0] if candidate_models else DEFAULT_HF_EMBED_MODELS[0],
+                    use_local_fallback=(embed_backend != "hf_inference"),
                     chunk_size=int(chunk_size),
                     chunk_overlap=int(chunk_overlap),
                     max_chunks=(None if int(max_chunks) == 0 else int(max_chunks)),
@@ -628,12 +630,9 @@ if uploaded_files and (st.session_state.get("chroma_info") is None):
     except Exception as e:
         st.error(f"Auto-indexing exception: {e}")
 
-# -------------------------
 # Main UI
-# -------------------------
 col1, col2 = st.columns([3,1])
 with col1:
-    # chat display
     for msg in st.session_state["messages"]:
         role = msg.get("role","assistant")
         content = msg.get("content","")
@@ -675,9 +674,8 @@ with col1:
                 except Exception as e:
                     answer = f"[HF fallback error] {e}"
             st.session_state["messages"].append({"role":"assistant","content":answer})
-            st.rerun()
+            st.experimental_rerun()
 
-    # text chat form
     with st.form("chat_form", clear_on_submit=True):
         user_input = st.text_area("Type your message:", height=140)
         send = st.form_submit_button("Send")
@@ -686,18 +684,18 @@ with col1:
         st.session_state["messages"].append({"role":"user","content":user_input})
         with st.spinner("Thinking..."):
             try:
-                memory = SimpleMemory(k=memory_window)
+                memory_window = memory_window if "memory_window" in locals() else 4
+                mem_items = st.session_state.get("messages", [])[-memory_window:]
+                mem_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in mem_items])
                 chroma_info = st.session_state.get("chroma_info")
                 final_answer = ""
                 if chroma_info and chroma_info.get("collection"):
                     collection = chroma_info["collection"]
-                    docs = query_collection(collection, user_input, hf_embed_model=hf_embed_model, k=3)
+                    docs = query_collection(collection, user_input, candidate_models=candidate_models, use_local_fallback=(embed_backend != "hf_inference"), k=3)
                     retrieved_texts = [d.get("document","")[:1000] for d in docs]
                     context = "\n\n---\n\n".join(retrieved_texts)
-                    mem_items = memory.load_memory()
-                    mem_text = "\n".join(f"{m.get('type')}: {m.get('content')}" for m in mem_items) if mem_items else ""
-                    system_prompt = "You are a helpful assistant. Use retrieved documents to answer concisely and accurately. If citing, mention the source filename."
-                    user_prompt = f"Conversation memory:\n{mem_text}\n\nRetrieved docs:\n{context}\n\nQuestion:\n{user_input}\n\nAnswer concisely."
+                    system_prompt = "You are a helpful assistant. Use retrieved documents to answer concisely and cite sources."
+                    user_prompt = f"Memory:\n{mem_text}\n\nRetrieved:\n{context}\n\nQuestion:\n{user_input}\n\nAnswer concisely."
                     if groq_client:
                         messages = [{"role":"system","content":system_prompt},{"role":"user","content":user_prompt}]
                         try:
@@ -742,7 +740,7 @@ with col1:
                 final_answer = f"[Unhandled error] {e}"
 
         st.session_state["messages"].append({"role":"assistant","content": final_answer})
-        st.rerun()
+        st.experimental_rerun()
 
 with col2:
     st.markdown("### RAG & Status")
@@ -760,7 +758,7 @@ with col2:
     st.markdown("---")
     if uploaded_files and st.button("Index uploaded files (HF embeddings -> Chroma)"):
         with st.spinner("Indexing..."):
-            info = index_uploaded_files(uploaded_files=uploaded_files, hf_embed_model=hf_embed_model, chunk_size=int(chunk_size), chunk_overlap=int(chunk_overlap), max_chunks=(None if int(max_chunks)==0 else int(max_chunks)))
+            info = index_uploaded_files(uploaded_files=uploaded_files, embed_backend=embed_backend, candidate_models=candidate_models, hf_embed_model_choice=candidate_models[0] if candidate_models else DEFAULT_HF_EMBED_MODELS[0], use_local_fallback=(embed_backend != "hf_inference"), chunk_size=int(chunk_size), chunk_overlap=int(chunk_overlap), max_chunks=(None if int(max_chunks)==0 else int(max_chunks)))
             if info:
                 st.session_state["chroma_info"] = info
                 st.success(f"Indexed {info.get('indexed_chunks')} chunks.")
@@ -769,10 +767,10 @@ with col2:
 
     st.markdown("---")
     if st.button("Show memory"):
-        mem = SimpleMemory(k=memory_window).load_memory()
+        mem = st.session_state.get("messages", [])[-memory_window:]
         st.write(mem)
 
     st.markdown("---")
-    st.caption("Set HF_API_TOKEN and GROQ_API_KEY in Streamlit Secrets or environment variables (recommended). OCR requires poppler + tesseract on the host to work.")
+    st.caption("Set HF_API_TOKEN and GROQ_API_KEY in Streamlit Secrets or environment variables (recommended). Installing sentence-transformers allows local embedding fallback (may download model on first run).")
 
-# End of file
+# End file
