@@ -506,7 +506,7 @@ with st.sidebar:
         for k in ["messages","chroma_info","last_fp"]:
             if k in st.session_state:
                 del st.session_state[k]
-        st.experimental_rerun()
+        st.rerun()
 
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
@@ -598,7 +598,7 @@ with col1:
                 else:
                     answer = "No HF token or Groq key available for text generation."
             st.session_state["messages"].append({"role":"assistant","content": f"🖼 Caption/OCR:\n{caption}\n\nAnswer:\n{answer}"})
-            st.experimental_rerun()
+            st.rerun()
 
     with st.form("chat_form", clear_on_submit=True):
         user_input = st.text_area("Type your message:", height=140)
@@ -654,7 +654,7 @@ with col1:
                 st.session_state["messages"].append({"role":"assistant","content": answer_text})
             except Exception as e:
                 st.session_state["messages"].append({"role":"assistant","content": f"[Unhandled error] {e}"})
-        st.experimental_rerun()
+        st.rerun()
 
 with col2:
     st.markdown("### RAG & Status")
