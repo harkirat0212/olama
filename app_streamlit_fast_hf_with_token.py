@@ -300,7 +300,7 @@ with st.sidebar:
         for k in ["messages", "chroma_info"]:
             if k in st.session_state:
                 del st.session_state[k]
-        st.experimental_rerun()
+        st.rerun()
 
 # session init
 if "messages" not in st.session_state:
@@ -347,7 +347,7 @@ with col1:
                 except Exception as e:
                     answer = f"Vision model error: {e}"
             st.session_state["messages"].append({"role": "assistant", "content": answer})
-            st.experimental_rerun()
+            st.rerun()
 
     # text chat form
     with st.form("chat_form", clear_on_submit=True):
@@ -391,7 +391,7 @@ with col1:
                 answer = f"Unhandled error: {e}"
 
         st.session_state["messages"].append({"role": "assistant", "content": answer})
-        st.experimental_rerun()
+        st.rerun()
 
 with col2:
     st.markdown("### RAG / Indexing")
