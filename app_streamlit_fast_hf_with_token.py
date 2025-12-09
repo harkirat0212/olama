@@ -1,404 +1,159 @@
-# app_streamlit_resilient.py
+# app_streamlit_final.py
 """
-Resilient Streamlit RAG app:
-- Robust HF embeddings & image captioning (tries InferenceClient -> HTTP endpoints -> local fallback)
-- Chroma vectorstore with robust constructor (persistent attempt, in-memory fallback)
-- PDF text extraction (pypdf) + OCR fallback (pdf2image + pytesseract) if available
-- @st.cache_resource for HF clients and local models to avoid repeated downloads
-- Clear UI diagnostic messages about which backend/model succeeded
+Final deployable Streamlit app:
+- Conversational RAG (Chroma) + Image analysis + PDF/TXT extraction + OCR fallback
+- Uses HF Inference API first, with local fallbacks if installed
+- Uses GROQ if GROQ key is set (or fallback provided)
+- Caches heavy resources with @st.cache_resource
+- Put HF_API_TOKEN / GROQ_API_KEY in Streamlit Secrets for production
 """
 
 import os
+import io
 import hashlib
 import tempfile
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Iterable
+from typing import List, Optional, Dict, Any
 
 import requests
 import streamlit as st
+from pypdf import PdfReader
+from PIL import Image
+
+# Chroma
 import chromadb
 from chromadb.config import Settings
-from pypdf import PdfReader
 
-# Optional deps (handled gracefully)
+# Graceful optional imports (OCR / local models)
+OCR_AVAILABLE = False
+TRANSFORMERS_AVAILABLE = False
+LOCAL_S2_AVAILABLE = False
 try:
-    from pdf2image import convert_from_path, convert_from_bytes
+    from pdf2image import convert_from_bytes, convert_from_path
     import pytesseract
+
     OCR_AVAILABLE = True
 except Exception:
     OCR_AVAILABLE = False
 
-# Optional local embedding model
+try:
+    from transformers import pipeline
+    TRANSFORMERS_AVAILABLE = True
+except Exception:
+    TRANSFORMERS_AVAILABLE = False
+
 try:
     from sentence_transformers import SentenceTransformer
     LOCAL_S2_AVAILABLE = True
 except Exception:
     LOCAL_S2_AVAILABLE = False
 
-# Optional huggingface_hub client
-try:
-    from huggingface_hub import InferenceClient
-    HF_HUB_AVAILABLE = True
-except Exception:
-    HF_HUB_AVAILABLE = False
-
 # -------------------------
-# FALLBACK TOKENS (you provided)
-# Replace or remove fallback tokens before publishing.
+# FALLBACK KEYS (you provided)
+# -------------------------
 GROQ_KEY_FALLBACK = "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"
 HF_KEY_FALLBACK = "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"
-# -------------------------
 
 # -------------------------
-# DEFAULT MODELS & CONFIG
+# CONFIG
 # -------------------------
-DEFAULT_HF_EMBED_CANDIDATES = [
-    "intfloat/e5-small",
-    "sentence-transformers/all-MiniLM-L6-v2",
-    "sentence-transformers/all-mpnet-base-v2",
-]
-DEFAULT_HF_IMAGE_CANDIDATES = [
-    "Salesforce/blip-image-captioning-large",
-    "nlpconnect/vit-gpt2-image-captioning",
-]
-
-DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
-TMP_DIR = Path(os.environ.get("STREAMLIT_CHROMA_DIR", tempfile.gettempdir())) / "chroma_persist_v_final"
-TMP_DIR.mkdir(parents=True, exist_ok=True)
-
-MAX_UPLOADS = 6
-MAX_UPLOAD_MB = 200
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
-BATCH_SIZE = 16
 HF_TIMEOUT = 60
+TMP_BASE = Path(tempfile.gettempdir()) / "streamlit_rag_chroma_final"
+TMP_BASE.mkdir(parents=True, exist_ok=True)
+MAX_UPLOAD_MB = 200
+BATCH_SIZE = 16
 
-st.set_page_config(page_title="RAG — resilient HF + Chroma", layout="wide")
+# Candidate HF models (tried in order)
+HF_EMBED_MODELS = ["intfloat/e5-small", "sentence-transformers/all-MiniLM-L6-v2"]
+HF_IMAGE_MODELS = ["nlpconnect/vit-gpt2-image-captioning", "Salesforce/blip-image-captioning-base"]
+HF_TEXT_MODEL_FALLBACK = "google/flan-t5-large"  # HF text generation fallback
+
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL_DEFAULT = "llama-3.3-70b-versatile"  # used only if GROQ key available
+
+st.set_page_config(page_title="RAG Chat — Final", layout="wide")
 
 # -------------------------
-# Utilities: tokens
+# Tokens (secrets -> env -> fallback)
 # -------------------------
-def get_hf_token() -> str:
-    token = os.environ.get("HF_API_TOKEN")
+def get_hf_token() -> Optional[str]:
+    token = None
+    try:
+        token = os.environ.get("HF_API_TOKEN") or (st.secrets.get("HF_API_TOKEN") if "HF_API_TOKEN" in st.secrets else None)
+    except Exception:
+        token = os.environ.get("HF_API_TOKEN")
     if token and token.strip():
         return token.strip()
-    try:
-        token = st.secrets.get("HF_API_TOKEN")  # recommended
-        if token and token.strip():
-            return token.strip()
-    except Exception:
-        pass
     return HF_KEY_FALLBACK
 
-def get_groq_key() -> str:
-    key = os.environ.get("GROQ_API_KEY")
+def get_groq_key() -> Optional[str]:
+    key = None
+    try:
+        key = os.environ.get("GROQ_API_KEY") or (st.secrets.get("GROQ_API_KEY") if "GROQ_API_KEY" in st.secrets else None)
+    except Exception:
+        key = os.environ.get("GROQ_API_KEY")
     if key and key.strip():
         return key.strip()
-    try:
-        key = st.secrets.get("GROQ_API_KEY")
-        if key and key.strip():
-            return key.strip()
-    except Exception:
-        pass
     return GROQ_KEY_FALLBACK
 
 # -------------------------
-# Cached clients & models
+# Cached clients & local models
 # -------------------------
 @st.cache_resource
 def get_hf_inference_client():
-    """Return a huggingface_hub.InferenceClient if possible, else None."""
-    if not HF_HUB_AVAILABLE:
-        return None
     token = get_hf_token()
     if not token:
         return None
     try:
+        from huggingface_hub import InferenceClient
         return InferenceClient(token=token)
     except Exception:
         return None
 
 @st.cache_resource
-def get_local_sentence_transformer(model_name: str = "all-MiniLM-L6-v2"):
-    """Load & cache a sentence-transformers model for local embeddings."""
+def get_local_sentence_transformer(model_name="all-MiniLM-L6-v2"):
     if not LOCAL_S2_AVAILABLE:
-        raise RuntimeError("sentence-transformers not installed.")
-    # Accept either repo id or short name
-    try:
-        return SentenceTransformer(model_name)
-    except Exception:
-        # attempt with HF repo id
-        return SentenceTransformer(f"sentence-transformers/{model_name}")
+        raise RuntimeError("sentence-transformers not installed on server.")
+    return SentenceTransformer(model_name)
+
+@st.cache_resource
+def get_local_caption_pipeline(model_name="nlpconnect/vit-gpt2-image-captioning"):
+    if not TRANSFORMERS_AVAILABLE:
+        raise RuntimeError("transformers not installed on server.")
+    return pipeline("image-to-text", model=model_name, device=-1)
 
 # -------------------------
-# Robust HF embeddings + image caption helpers
+# Chroma helper (tries a few constructors; falls back to in-memory)
 # -------------------------
-class HFResilient:
-    """Try InferenceClient -> HTTP endpoints -> local fallback for embeddings & image captions."""
-
-    def __init__(self, embed_models: List[str], image_models: List[str], local_fallback: bool = True, timeout: int = HF_TIMEOUT):
-        self.embed_models = embed_models
-        self.image_models = image_models
-        self.local_fallback = local_fallback
-        self.timeout = timeout
-        self.hf_token = get_hf_token()
-        self.hf_client = get_hf_inference_client()
-        self.headers = {"Authorization": f"Bearer {self.hf_token}"} if self.hf_token else {}
-
-    # --- embeddings ---
-    def _http_embeddings(self, model: str, texts: List[str]) -> Optional[List[List[float]]]:
-        endpoints = [
-            f"https://api-inference.huggingface.co/embeddings/{model}",
-            f"https://api-inference.huggingface.co/pipeline/feature-extraction/{model}",
-            f"https://api-inference.huggingface.co/models/{model}/pipeline/feature-extraction",
-        ]
-        payload = {"inputs": texts}
-        for url in endpoints:
-            try:
-                r = requests.post(url, headers={**self.headers, "Content-Type":"application/json"}, json=payload, timeout=self.timeout)
-                if r.status_code in (404, 410, 403):
-                    # unsupported route/model -> try next endpoint/model
-                    continue
-                r.raise_for_status()
-                data = r.json()
-                # Normalize list of list result
-                if isinstance(data, list) and data and isinstance(data[0], list):
-                    return data
-                # some endpoints return list of dicts with 'embedding' key
-                if isinstance(data, list) and data and isinstance(data[0], dict):
-                    out = []
-                    for item in data:
-                        if "embedding" in item:
-                            out.append(item["embedding"])
-                        elif "vector" in item:
-                            out.append(item["vector"])
-                        else:
-                            # try to find first list of floats in values
-                            found = None
-                            for v in item.values():
-                                if isinstance(v, list) and all(isinstance(x, (float,int)) for x in v):
-                                    found = v; break
-                            if found:
-                                out.append(found)
-                            else:
-                                out = None
-                                break
-                    if out:
-                        return out
-                # otherwise continue trying
-            except requests.HTTPError as he:
-                status = getattr(he.response, "status_code", None)
-                if status in (404, 410, 403):
-                    continue
-                raise
-            except Exception:
-                continue
-        return None
-
-    def _hf_client_embeddings(self, model: str, texts: List[str]) -> Optional[List[List[float]]]:
-        if not self.hf_client:
-            return None
+def make_chroma_client(persist_directory: Optional[str] = None) -> chromadb.Client:
+    persist_directory = str(persist_directory) if persist_directory else None
+    candidates = []
+    if persist_directory:
+        candidates.append({"persist_directory": persist_directory, "chroma_api_impl": "duckdb+parquet"})
+        candidates.append({"persist_directory": persist_directory, "chroma_db_impl": "duckdb+parquet"})
+        candidates.append({"persist_directory": persist_directory})
+    else:
+        candidates.append({})
+    last_exc = None
+    for cfg in candidates:
         try:
-            # InferenceClient has embeddings(...) method in modern versions
-            out = self.hf_client.embeddings(model=model, inputs=texts)
-            # out expected to be list-of-vectors
-            if isinstance(out, list) and out and isinstance(out[0], list):
-                return out
-            # fallback: call model pipeline
-            resp = self.hf_client(texts, model=model)
-            if isinstance(resp, list) and resp and isinstance(resp[0], list):
-                return resp
-        except Exception:
-            return None
-        return None
-
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        # Try hf client first per model
-        for model in self.embed_models:
-            if self.hf_client:
-                try:
-                    out = self._hf_client_embeddings(model, texts)
-                    if out:
-                        st.info(f"Embeddings: HF InferenceClient success with model: {model}")
-                        return out
-                except Exception as e:
-                    st.info(f"HF client embeddings attempt failed for {model}: {e}")
-
-            # Try HTTP endpoints
-            try:
-                out = self._http_embeddings(model, texts)
-                if out:
-                    st.info(f"Embeddings: HF HTTP endpoint success with model: {model}")
-                    return out
-            except Exception as e:
-                st.info(f"HF HTTP embeddings attempt failed for {model}: {e}")
-                continue
-
-        # Local fallback
-        if self.local_fallback:
-            if LOCAL_S2_AVAILABLE:
-                st.info("Embeddings: falling back to local sentence-transformers (may download on first run).")
-                model_name = self.embed_models[0] if self.embed_models else "all-MiniLM-L6-v2"
-                # try robust local model loader
-                try:
-                    m = get_local_sentence_transformer(model_name if "all-" not in model_name else model_name)
-                except Exception:
-                    # fallback to a safe local id
-                    m = get_local_sentence_transformer("all-MiniLM-L6-v2")
-                arr = m.encode(texts, show_progress_bar=False, batch_size=BATCH_SIZE, convert_to_numpy=True)
-                return [v.tolist() for v in arr]
-            else:
-                raise RuntimeError("HF embedding endpoints failed and local sentence-transformers is not installed.")
-        raise RuntimeError("All embedding backends failed (HF endpoints + local fallback).")
-
-    def embed_query(self, text: str) -> List[float]:
-        res = self.embed_documents([text])
-        if not res or not isinstance(res, list):
-            raise RuntimeError("Failed to compute query embedding")
-        return res[0]
-
-    # --- image caption ---
-    def _http_image_caption(self, model: str, image_bytes: bytes) -> Optional[str]:
-        url = f"https://api-inference.huggingface.co/models/{model}"
-        files = {"image": ("image.jpg", image_bytes, "image/jpeg")}
-        for attempt in range(1):
-            try:
-                r = requests.post(url, headers=self.headers, files=files, timeout=self.timeout)
-                if r.status_code in (404, 410, 403):
-                    return None
-                r.raise_for_status()
-                out = r.json()
-                # many HF image caption endpoints return list with dict->generated_text
-                if isinstance(out, list) and out and isinstance(out[0], dict) and "generated_text" in out[0]:
-                    return out[0]["generated_text"]
-                if isinstance(out, dict) and "generated_text" in out:
-                    return out["generated_text"]
-                # some return 'caption' or 'result'
-                if isinstance(out, dict):
-                    for k in ("caption","result","text"):
-                        if k in out and isinstance(out[k], str):
-                            return out[k]
-                return str(out)
-            except requests.HTTPError as he:
-                status = getattr(he.response, "status_code", None)
-                if status in (404,410,403):
-                    return None
-                continue
-            except Exception:
-                continue
-        return None
-
-    def _hf_client_image_caption(self, model: str, image_bytes: bytes) -> Optional[str]:
-        if not self.hf_client:
-            return None
-        try:
-            # InferenceClient usually supports passing files as bytes
-            res = self.hf_client(inputs=image_bytes, model=model)
-            # normalize
-            if isinstance(res, dict) and "generated_text" in res:
-                return res["generated_text"]
-            if isinstance(res, list) and res and isinstance(res[0], dict) and "generated_text" in res[0]:
-                return res[0]["generated_text"]
-            return None
-        except Exception:
-            return None
-
-    def caption_image(self, image_bytes: bytes) -> str:
-        for model in self.image_models:
-            # hf client
-            if self.hf_client:
-                try:
-                    out = self._hf_client_image_caption(model, image_bytes)
-                    if out:
-                        st.info(f"Image caption: HF InferenceClient success with model {model}")
-                        return out
-                except Exception as e:
-                    st.info(f"HF client image caption error for {model}: {e}")
-            # http endpoint
-            try:
-                out = self._http_image_caption(model, image_bytes)
-                if out:
-                    st.info(f"Image caption: HF HTTP endpoint success with model {model}")
-                    return out
-            except Exception as e:
-                st.info(f"HF HTTP image caption error for {model}: {e}")
-                continue
-
-        # Local fallback: very basic (if no HF available) - attempt to use transformers' pipeline if installed
-        try:
-            from transformers import pipeline
-            # try a captioning pipeline with a known model - may download heavy model
-            try_models = ["nlpconnect/vit-gpt2-image-captioning", "Salesforce/blip-image-captioning-base"]
-            for m in try_models:
-                try:
-                    pipe = pipeline("image-to-text", model=m, device=-1)
-                    out = pipe(image_bytes)
-                    if isinstance(out, list) and out and isinstance(out[0], dict) and "generated_text" in out[0]:
-                        return out[0]["generated_text"]
-                    # pipeline may return list of strings
-                    if isinstance(out, list) and out and isinstance(out[0], str):
-                        return out[0]
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
-        raise RuntimeError("All image caption backends failed (HF endpoints + local fallback).")
-
-# -------------------------
-# Chroma helpers (robust)
-# -------------------------
-def chroma_client(persist_directory: str) -> chromadb.Client:
-    persist_directory = str(persist_directory)
-    tried = []
-    candidates = [
-        {"persist_directory": persist_directory, "chroma_api_impl": "duckdb+parquet"},
-        {"persist_directory": persist_directory, "chroma_db_impl": "duckdb+parquet"},
-        {"persist_directory": persist_directory, "chroma_api_impl": "duckdb"},
-        {"persist_directory": persist_directory, "chroma_db_impl": "duckdb"},
-        {"persist_directory": persist_directory},
-    ]
-    for s in candidates:
-        try:
-            settings = Settings(**s)
+            settings = Settings(**cfg)
             client = chromadb.Client(settings)
-            try:
-                _ = client.list_collections()
-            except Exception:
-                pass
-            st.info(f"Chroma client initialized with settings: {list(s.keys())}")
+            _ = client.list_collections()  # quick check
+            st.info(f"Chroma client initialized with settings: {list(cfg.keys()) or ['default']}")
             return client
         except Exception as e:
-            tried.append((s, str(e)))
+            last_exc = e
             continue
-    # fallback to in-memory
     try:
-        st.warning("Persistent Chroma init failed; falling back to in-memory Chroma (no persistence).")
         client = chromadb.Client()
+        st.warning("Falling back to in-memory Chroma (no persistence).")
         return client
     except Exception as e:
-        err = f"Could not initialize Chroma client. Tried: {tried}. Last error: {e}"
-        st.error(err)
-        raise RuntimeError(err)
-
-def ensure_collection(client: chromadb.Client, name: str):
-    try:
-        return client.get_collection(name=name)
-    except Exception:
-        try:
-            return client.create_collection(name=name)
-        except Exception:
-            try:
-                cols = client.list_collections()
-                for c in cols:
-                    if isinstance(c, dict) and c.get("name") == name:
-                        return client.get_collection(name=name)
-            except Exception:
-                pass
-            raise RuntimeError(f"Could not create or get collection '{name}'.")
+        raise RuntimeError(f"Could not initialize Chroma client. Last error: {last_exc or e}")
 
 # -------------------------
-# File helpers: fingerprint, chunking, OCR
+# Utilities
 # -------------------------
 def fingerprint_files(files: List[st.runtime.uploaded_file_manager.UploadedFile]) -> str:
     h = hashlib.sha256()
@@ -413,7 +168,7 @@ def fingerprint_files(files: List[st.runtime.uploaded_file_manager.UploadedFile]
         h.update(str(size).encode("utf-8"))
     return h.hexdigest()[:16]
 
-def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
+def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
     if not text:
         return []
     chunks = []
@@ -427,116 +182,252 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
         start = end - overlap
     return chunks
 
-def ocr_pdf_to_text_bytes(pdf_path: Path) -> str:
-    if not OCR_AVAILABLE:
-        return ""
-    pages_txt = []
+# -------------------------
+# PDF extraction (pypdf -> OCR)
+# -------------------------
+def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+    # Try pypdf extraction
     try:
-        images = convert_from_path(str(pdf_path), dpi=300)
-        for im in images:
-            pages_txt.append(pytesseract.image_to_string(im))
-        return "\n\n".join(pages_txt)
-    except Exception:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        pages = [p.extract_text() or "" for p in reader.pages]
+        text = "\n\n".join(pages).strip()
+        if text:
+            st.info("Extracted text via pypdf.")
+            return text
+        st.info("pypdf returned no text (likely image-only PDF).")
+    except Exception as e:
+        st.info(f"pypdf extraction error: {e}")
+
+    # OCR fallback via pdf2image + pytesseract
+    if OCR_AVAILABLE:
         try:
-            data = pdf_path.read_bytes()
-            images = convert_from_bytes(data, dpi=300)
+            images = convert_from_bytes(pdf_bytes, dpi=300)
+            page_texts = []
             for im in images:
-                pages_txt.append(pytesseract.image_to_string(im))
-            return "\n\n".join(pages_txt)
-        except Exception:
-            return ""
+                page_texts.append(pytesseract.image_to_string(im))
+            aggregated = "\n\n".join(page_texts).strip()
+            if aggregated:
+                st.info("Extracted text via OCR (pytesseract).")
+                return aggregated
+            st.info("OCR returned empty text.")
+        except Exception as e:
+            st.info(f"OCR conversion error: {e}")
+    else:
+        st.info("OCR not available (pdf2image/pytesseract missing).")
+    return ""
 
 # -------------------------
-# Indexing & querying using HFResilient
+# Image caption / OCR (HF -> local -> OCR)
 # -------------------------
-def index_uploaded_files(uploaded_files, hf_resilient: HFResilient, chunk_size: int, chunk_overlap: int, max_chunks: Optional[int]):
+def hf_http_image_caption(model: str, image_bytes: bytes) -> Optional[str]:
+    token = get_hf_token()
+    if not token:
+        return None
+    url = f"https://api-inference.huggingface.co/models/{model}"
+    try:
+        r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, files={"image": ("img.jpg", image_bytes, "image/jpeg")}, timeout=HF_TIMEOUT)
+        if r.status_code in (403, 404, 410):
+            return None
+        r.raise_for_status()
+        j = r.json()
+        if isinstance(j, list) and j and isinstance(j[0], dict):
+            return j[0].get("generated_text") or j[0].get("caption") or str(j[0])
+        if isinstance(j, dict):
+            if "generated_text" in j:
+                return j["generated_text"]
+            if "caption" in j:
+                return j["caption"]
+        return str(j)
+    except Exception:
+        return None
+
+def caption_image_resilient(image_bytes: bytes, candidate_models: List[str]) -> str:
+    # Try HF InferenceClient if available
+    hf_client = get_hf_inference_client()
+    if hf_client:
+        for model in candidate_models:
+            try:
+                resp = hf_client(inputs=image_bytes, model=model, timeout=HF_TIMEOUT)
+                if isinstance(resp, dict) and "generated_text" in resp:
+                    st.info(f"Image caption via HF client (model={model})")
+                    return resp["generated_text"]
+                if isinstance(resp, list) and resp and isinstance(resp[0], dict) and "generated_text" in resp[0]:
+                    st.info(f"Image caption via HF client (model={model})")
+                    return resp[0]["generated_text"]
+            except Exception:
+                continue
+    # Try HF HTTP endpoints
+    for model in candidate_models:
+        out = hf_http_image_caption(model, image_bytes)
+        if out:
+            st.info(f"Image caption via HF HTTP endpoint (model={model})")
+            return out
+    # Local transformers pipeline
+    if TRANSFORMERS_AVAILABLE:
+        try:
+            pipe = get_local_caption_pipeline(candidate_models[0])
+            pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            res = pipe(pil)
+            if isinstance(res, list) and res and isinstance(res[0], dict):
+                txt = res[0].get("generated_text") or res[0].get("caption")
+                if txt:
+                    st.info("Image caption via local transformers pipeline.")
+                    return txt
+            if isinstance(res, str):
+                return res
+            if isinstance(res, list) and res and isinstance(res[0], str):
+                return res[0]
+        except Exception as e:
+            st.info(f"Local transformers caption error: {e}")
+    # OCR fallback (pytesseract)
+    if OCR_AVAILABLE:
+        try:
+            pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            txt = pytesseract.image_to_string(pil)
+            if txt and txt.strip():
+                st.info("Image OCR (pytesseract) returned text.")
+                return txt
+            st.info("Image OCR returned empty text.")
+        except Exception as e:
+            st.info(f"Image OCR error: {e}")
+
+    raise RuntimeError("Image captioning/OCR failed. Please provide HF token or install transformers/pytesseract on the server.")
+
+# -------------------------
+# Embeddings (HF -> local fallback)
+# -------------------------
+def hf_http_embeddings(model: str, texts: List[str]) -> Optional[List[List[float]]]:
+    token = get_hf_token()
+    if not token:
+        return None
+    url = f"https://api-inference.huggingface.co/embeddings/{model}"
+    try:
+        r = requests.post(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json={"inputs": texts}, timeout=HF_TIMEOUT)
+        if r.status_code in (403, 404, 410):
+            return None
+        r.raise_for_status()
+        j = r.json()
+        if isinstance(j, list) and j and isinstance(j[0], list):
+            return j
+        if isinstance(j, list) and j and isinstance(j[0], dict):
+            out = []
+            for itm in j:
+                if "embedding" in itm:
+                    out.append(itm["embedding"])
+                elif "vector" in itm:
+                    out.append(itm["vector"])
+            if out:
+                return out
+        return None
+    except Exception:
+        return None
+
+def embed_texts_resilient(texts: List[str], candidate_models: List[str]) -> List[List[float]]:
+    # Try HF HTTP endpoints
+    for m in candidate_models:
+        out = hf_http_embeddings(m, texts)
+        if out:
+            st.info(f"Embeddings via HF endpoint (model={m})")
+            return out
+    # Try HF client
+    hf_client = get_hf_inference_client()
+    if hf_client:
+        for m in candidate_models:
+            try:
+                out = hf_client.embeddings(model=m, inputs=texts)
+                if out and isinstance(out, list):
+                    st.info(f"Embeddings via HF client (model={m})")
+                    return out
+            except Exception:
+                continue
+    # Local fallback
+    if LOCAL_S2_AVAILABLE:
+        try:
+            model_name = candidate_models[0] if candidate_models else "all-MiniLM-L6-v2"
+            m = get_local_sentence_transformer(model_name)
+            arr = m.encode(texts, show_progress_bar=False, batch_size=BATCH_SIZE, convert_to_numpy=True)
+            st.info("Embeddings via local sentence-transformers.")
+            return [v.tolist() for v in arr]
+        except Exception as e:
+            raise RuntimeError(f"All embedding backends failed; local fallback error: {e}")
+    raise RuntimeError("All embedding backends failed and no local model available.")
+
+# -------------------------
+# Build Chroma from uploads
+# -------------------------
+def build_chroma_from_uploads(uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile], candidate_embed_models: List[str], max_chunks: Optional[int] = None):
     if not uploaded_files:
         return None
     fp = fingerprint_files(uploaded_files)
-    persist_dir = str(TMP_DIR / fp)
-    Path(persist_dir).mkdir(parents=True, exist_ok=True)
-
+    persist_dir = TMP_BASE / fp
+    persist_dir.mkdir(parents=True, exist_ok=True)
     try:
-        client = chroma_client(persist_dir)
+        client = make_chroma_client(str(persist_dir))
     except Exception as e:
         st.error(f"Chroma init error: {e}")
         return None
 
     try:
-        col = ensure_collection(client, f"col_{fp}")
+        try:
+            col = client.get_collection(name=f"col_{fp}")
+        except Exception:
+            col = client.create_collection(name=f"col_{fp}")
     except Exception as e:
         st.error(f"Chroma collection error: {e}")
         return None
 
     # If already indexed, skip
     try:
-        cnt = col.count()
-        if cnt and cnt > 0:
-            return {"collection": col, "persist_dir": persist_dir, "indexed_chunks": cnt, "snippets": []}
+        if col.count() and col.count() > 0:
+            st.success(f"Collection already indexed with {col.count()} items.")
+            return {"collection": col, "persist_dir": str(persist_dir), "indexed_chunks": col.count(), "snippets": []}
     except Exception:
         pass
 
-    texts, ids, metadatas, snippets = [], [], [], []
-    for uploaded in uploaded_files[:MAX_UPLOADS]:
+    texts = []
+    ids = []
+    metadatas = []
+    snippets = []
+
+    for uploaded in uploaded_files:
         try:
             size = getattr(uploaded, "size", None) or len(uploaded.getbuffer())
         except Exception:
             size = 0
         if size > MAX_UPLOAD_MB * 1024 * 1024:
-            st.warning(f"Skipping {uploaded.name}: >{MAX_UPLOAD_MB}MB")
+            st.warning(f"Skipping {uploaded.name} (> {MAX_UPLOAD_MB}MB)")
             continue
-
-        raw_dir = Path(persist_dir) / "raw"
-        raw_dir.mkdir(parents=True, exist_ok=True)
-        target = raw_dir / uploaded.name
-        with open(target, "wb") as f:
-            f.write(uploaded.getbuffer())
-
-        text = ""
+        data = uploaded.getbuffer().tobytes()
+        file_text = ""
         if uploaded.name.lower().endswith(".pdf"):
-            try:
-                reader = PdfReader(str(target))
-                pages = [p.extract_text() or "" for p in reader.pages]
-                text = "\n\n".join(pages).strip()
-            except Exception as e:
-                st.info(f"pypdf error for {uploaded.name}: {e}")
-                text = ""
-            if (not text or not text.strip()) and OCR_AVAILABLE:
-                st.info(f"No text via pypdf for {uploaded.name}; trying OCR...")
-                try:
-                    ocr_text = ocr_pdf_to_text_bytes(target)
-                    if ocr_text and ocr_text.strip():
-                        text = ocr_text
-                except Exception as e:
-                    st.info(f"OCR error for {uploaded.name}: {e}")
+            file_text = extract_text_from_pdf_bytes(data)
         else:
             try:
-                text = target.read_text(encoding="utf-8", errors="ignore")
+                file_text = data.decode("utf-8", errors="ignore")
             except Exception:
                 try:
-                    text = target.read_text(encoding="latin-1", errors="ignore")
+                    file_text = data.decode("latin-1", errors="ignore")
                 except Exception:
-                    text = ""
-
-        if not text or not text.strip():
+                    file_text = ""
+        if not file_text or not file_text.strip():
             st.info(f"No text extracted from {uploaded.name}; skipping.")
             continue
-
-        chunks = chunk_text(text, chunk_size=chunk_size, overlap=chunk_overlap)
+        chunks = chunk_text(file_text)
         for i, c in enumerate(chunks):
             uid = f"{uploaded.name}__{i}"
             ids.append(uid)
             texts.append(c)
             metadatas.append({"source": uploaded.name, "chunk": i})
-            snippets.append({"name": uploaded.name, "preview": c[:300]})
+            snippets.append({"name": uploaded.name, "preview": c[:200]})
 
     if not texts:
-        st.warning("No text to index.")
+        st.warning("No text extracted to index.")
         return None
 
     if max_chunks and len(texts) > max_chunks:
-        st.info(f"Indexing first {max_chunks} chunks (out of {len(texts)})")
-        texts = texts[:max_chunks]; ids = ids[:max_chunks]; metadatas = metadatas[:max_chunks]
+        texts = texts[:max_chunks]
+        ids = ids[:max_chunks]
+        metadatas = metadatas[:max_chunks]
 
     # compute embeddings
     try:
@@ -545,30 +436,36 @@ def index_uploaded_files(uploaded_files, hf_resilient: HFResilient, chunk_size: 
         total = len(texts)
         for i in range(0, total, BATCH_SIZE):
             batch = texts[i : i + BATCH_SIZE]
-            ev = hf_resilient.embed_documents(batch)
+            ev = embed_texts_resilient(batch, candidate_embed_models)
             embeddings.extend(ev)
             progress.progress(min(100, int(100 * (i + len(batch)) / total)))
         progress.empty()
     except Exception as e:
-        st.error(f"Embedding step failed: {e}")
+        st.error(f"Embedding computation failed: {e}")
         return None
 
+    # add to chroma
     try:
         col.add(documents=texts, metadatas=metadatas, ids=ids, embeddings=embeddings)
-        client.persist()
+        try:
+            client.persist()
+        except Exception:
+            st.info("client.persist() unsupported or failed in this environment (using in-memory/partial persist).")
+        return {"collection": col, "persist_dir": str(persist_dir), "indexed_chunks": len(texts), "snippets": snippets}
     except Exception as e:
         st.error(f"Failed to save to Chroma: {e}")
         return None
 
-    return {"collection": col, "persist_dir": persist_dir, "indexed_chunks": len(texts), "snippets": snippets}
-
-def query_collection(collection: chromadb.api.models.Collection, hf_resilient: HFResilient, query: str, k: int = 3):
+# -------------------------
+# Query helper
+# -------------------------
+def query_chroma_collection(collection, query_text: str, candidate_embed_models: List[str], k: int = 3):
     if collection is None:
         return []
     try:
-        qv = hf_resilient.embed_query(query)
+        qv = embed_texts_resilient([query_text], candidate_embed_models)[0]
     except Exception as e:
-        st.error(f"Query embedding error: {e}")
+        st.error(f"Query embed error: {e}")
         return []
     try:
         res = collection.query(query_embeddings=[qv], n_results=k, include=["documents","metadatas","distances"])
@@ -588,22 +485,17 @@ def query_collection(collection: chromadb.api.models.Collection, hf_resilient: H
 # -------------------------
 with st.sidebar:
     st.header("Settings")
-    st.markdown("**Embeddings candidate models (tried in order)**")
-    embed_models_txt = st.text_area("HF embedding models (comma separated)", value=",".join(DEFAULT_HF_EMBED_CANDIDATES), height=80)
-    embed_models = [m.strip() for m in embed_models_txt.split(",") if m.strip()]
-    st.markdown("**Image caption candidate models (tried in order)**")
-    image_models_txt = st.text_area("HF image models (comma separated)", value=",".join(DEFAULT_HF_IMAGE_CANDIDATES), height=60)
-    image_models = [m.strip() for m in image_models_txt.split(",") if m.strip()]
-    st.markdown("---")
-    uploaded_files = st.file_uploader("Upload PDF/TXT (multiple)", type=["pdf","txt"], accept_multiple_files=True)
+    st.markdown("**HF token**: set `HF_API_TOKEN` in Streamlit Secrets or env (recommended).")
+    st.markdown("**GROQ key**: set `GROQ_API_KEY` in Secrets/env to use Groq (optional).")
+    uploaded_files = st.file_uploader("Upload PDF / TXT (multiple)", type=["pdf","txt"], accept_multiple_files=True)
     image_file = st.file_uploader("Upload image (optional)", type=["png","jpg","jpeg"])
-    chunk_size = st.number_input("Chunk size", value=CHUNK_SIZE, min_value=256)
-    chunk_overlap = st.number_input("Chunk overlap", value=CHUNK_OVERLAP, min_value=0)
+    st.markdown("---")
+    st.subheader("Indexing options")
     max_chunks = st.number_input("Max chunks to index (0=no limit)", value=0, min_value=0)
-    memory_window = st.slider("Memory window", 1, 10, 4)
+    memory_window = st.slider("Memory window", 1, 8, 4)
     st.markdown("---")
     if st.button("Clear conversation & index"):
-        for k in ["messages","chroma_info","last_upload_fp"]:
+        for k in ["messages","chroma_info","last_fp"]:
             if k in st.session_state:
                 del st.session_state[k]
         st.rerun()
@@ -613,92 +505,87 @@ if "messages" not in st.session_state:
 if "chroma_info" not in st.session_state:
     st.session_state["chroma_info"] = None
 
-# Build HFResilient helper once (cached)
-hf_res = HFResilient(embed_models=embed_models, image_models=image_models, local_fallback=True)
-
-st.title("RAG Chat — resilient HF + Chroma")
+st.title("RAG Chat — Final (HF Inference + OCR)")
 
 # Auto-index uploaded files (once per fingerprint)
 if uploaded_files and st.session_state.get("chroma_info") is None:
     try:
-        uploaded_fp = fingerprint_files(uploaded_files)
-        prev_fp = st.session_state.get("last_upload_fp")
-        if uploaded_fp != prev_fp:
-            st.session_state["last_upload_fp"] = uploaded_fp
-            with st.spinner("Auto-indexing uploaded files..."):
-                info = index_uploaded_files(uploaded_files=uploaded_files, hf_resilient=hf_res, chunk_size=int(chunk_size), chunk_overlap=int(chunk_overlap), max_chunks=(None if int(max_chunks) == 0 else int(max_chunks)))
+        new_fp = fingerprint_files(uploaded_files)
+        prev_fp = st.session_state.get("last_fp")
+        if new_fp != prev_fp:
+            st.session_state["last_fp"] = new_fp
+            with st.spinner("Indexing uploaded files..."):
+                max_chunks_val = None if int(max_chunks) == 0 else int(max_chunks)
+                info = build_chroma_from_uploads(uploaded_files, HF_EMBED_MODELS, max_chunks=max_chunks_val)
                 if info:
                     st.session_state["chroma_info"] = info
-                    st.success(f"Auto-indexed {info.get('indexed_chunks')} chunks.")
+                    st.success(f"Indexed {info.get('indexed_chunks')} chunks.")
                 else:
-                    st.error("Auto-indexing failed; check logs or HF/Chroma initialization.")
+                    st.error("Indexing failed. Check logs or tokens.")
     except Exception as e:
         st.error(f"Auto-indexing exception: {e}")
 
 col1, col2 = st.columns([3,1])
+
 with col1:
-    for msg in st.session_state["messages"]:
-        role = msg.get("role","assistant")
-        content = msg.get("content","")
+    # display messages
+    for m in st.session_state["messages"]:
+        role = m.get("role","assistant")
+        content = m.get("content","")
         if role == "user":
             st.markdown(f'<div style="display:flex;justify-content:flex-end"><div style="background:#DCF8C6;padding:10px;border-radius:10px;max-width:80%">{content}</div></div>', unsafe_allow_html=True)
         else:
             st.markdown(f'<div style="display:flex;justify-content:flex-start"><div style="background:#fff;padding:10px;border-radius:10px;max-width:80%">{content}</div></div>', unsafe_allow_html=True)
 
-    # Image analyze
+    # image analyze
     if image_file:
+        st.markdown("### Uploaded Image")
         st.image(image_file, use_column_width=True)
         q_img = st.text_input("Ask something about this image (optional):")
-        if q_img and st.button("Analyze image"):
+        if st.button("Analyze Image"):
             img_bytes = image_file.getvalue()
-            with st.spinner("Captioning image..."):
+            with st.spinner("Captioning/reading image..."):
                 try:
-                    caption = hf_res.caption_image(img_bytes)
+                    caption = caption_image_resilient(img_bytes, HF_IMAGE_MODELS)
                 except Exception as e:
-                    caption = f"[Caption error] {e}"
-            # Build prompt with caption
-            prompt = f"Image caption: {caption}\n\nQuestion: {q_img}\nAnswer concisely."
-            # Use Groq if available or HF text-model fallback
+                    caption = f"[Caption/OCR error] {e}"
+            # Generate answer using Groq if available, else HF text fallback
+            question = q_img.strip()
+            prompt = f"Image caption / OCR:\n{caption}\n\nQuestion: {question or 'Describe the image.'}\nAnswer concisely."
             groq_key = get_groq_key()
+            answer = ""
             if groq_key:
                 try:
-                    response = requests.post("https://api.groq.com/openai/v1/chat/completions",
-                                             headers={"Authorization": f"Bearer {groq_key}", "Content-Type":"application/json"},
-                                             json={"model": DEFAULT_GROQ_MODEL, "messages":[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":prompt}], "max_tokens":512},
-                                             timeout=HF_TIMEOUT)
-                    response.raise_for_status()
-                    data = response.json()
-                    choice = data.get("choices",[{}])[0]
-                    out_text = choice.get("message",{}).get("content") if isinstance(choice.get("message"),dict) else choice.get("text")
-                    answer = out_text or str(data)
+                    r = requests.post(GROQ_API_URL, headers={"Authorization": f"Bearer {groq_key}", "Content-Type":"application/json"},
+                                      json={"model": GROQ_MODEL_DEFAULT, "messages":[{"role":"user","content":prompt}], "max_tokens":512}, timeout=HF_TIMEOUT)
+                    r.raise_for_status()
+                    j = r.json()
+                    choice = j.get("choices",[{}])[0]
+                    text = ""
+                    if isinstance(choice.get("message"), dict):
+                        text = choice["message"].get("content") or ""
+                    else:
+                        text = choice.get("text") or ""
+                    answer = text or str(j)
                 except Exception as e:
-                    # HF text fallback
+                    answer = f"[Groq generation error] {e}"
+            else:
+                hf_token = get_hf_token()
+                if hf_token:
                     try:
-                        hf_text_url = "https://api-inference.huggingface.co/models/google/flan-t5-large"
-                        r = requests.post(hf_text_url, headers={"Authorization": f"Bearer {get_hf_token()}"}, json={"inputs": prompt}, timeout=HF_TIMEOUT)
+                        url = f"https://api-inference.huggingface.co/models/{HF_TEXT_MODEL_FALLBACK}"
+                        r = requests.post(url, headers={"Authorization": f"Bearer {hf_token}"}, json={"inputs": prompt}, timeout=HF_TIMEOUT)
                         r.raise_for_status()
                         out = r.json()
                         if isinstance(out, list) and out and isinstance(out[0], dict) and "generated_text" in out[0]:
                             answer = out[0]["generated_text"]
                         else:
                             answer = str(out)
-                    except Exception as ee:
-                        answer = f"[Generation error] {ee}"
-            else:
-                # HF text fallback
-                try:
-                    hf_text_url = "https://api-inference.huggingface.co/models/google/flan-t5-large"
-                    r = requests.post(hf_text_url, headers={"Authorization": f"Bearer {get_hf_token()}"}, json={"inputs": prompt}, timeout=HF_TIMEOUT)
-                    r.raise_for_status()
-                    out = r.json()
-                    if isinstance(out, list) and out and isinstance(out[0], dict) and "generated_text" in out[0]:
-                        answer = out[0]["generated_text"]
-                    else:
-                        answer = str(out)
-                except Exception as ee:
-                    answer = f"[Generation error] {ee}"
-
-            st.session_state["messages"].append({"role":"assistant","content": answer})
+                    except Exception as e:
+                        answer = f"[HF text generation error] {e}"
+                else:
+                    answer = "No HF token or Groq key available for text generation."
+            st.session_state["messages"].append({"role":"assistant","content": f"🖼 Caption/OCR:\n{caption}\n\nAnswer:\n{answer}"})
             st.rerun()
 
     # Text chat
@@ -711,95 +598,51 @@ with col1:
         with st.spinner("Thinking..."):
             try:
                 chroma_info = st.session_state.get("chroma_info")
-                final_answer = ""
+                answer_text = ""
                 if chroma_info and chroma_info.get("collection"):
                     collection = chroma_info["collection"]
-                    docs = query_collection(collection, hf_res, user_input, k=3)
-                    retrieved_texts = [d.get("document","")[:1000] for d in docs]
-                    context = "\n\n---\n\n".join(retrieved_texts)
+                    docs = query_chroma_collection(collection, user_input, HF_EMBED_MODELS, k=3)
+                    retrieved = "\n\n---\n\n".join([d.get("document","")[:1000] for d in docs])
                     mem = st.session_state.get("messages", [])[-memory_window:]
                     mem_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in mem])
-                    prompt = f"Memory:\n{mem_text}\n\nRetrieved:\n{context}\n\nQuestion:\n{user_input}\n\nAnswer concisely."
-                    groq_key = get_groq_key()
-                    if groq_key:
-                        try:
-                            r = requests.post("https://api.groq.com/openai/v1/chat/completions",
-                                              headers={"Authorization": f"Bearer {groq_key}", "Content-Type":"application/json"},
-                                              json={"model": DEFAULT_GROQ_MODEL, "messages":[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":prompt}], "max_tokens":512},
-                                              timeout=HF_TIMEOUT)
-                            r.raise_for_status()
-                            data = r.json()
-                            choice = data.get("choices",[{}])[0]
-                            out_text = choice.get("message",{}).get("content") if isinstance(choice.get("message"),dict) else choice.get("text")
-                            final_answer = out_text or str(data)
-                        except Exception as e:
-                            # HF text fallback
-                            try:
-                                hf_text_url = "https://api-inference.huggingface.co/models/google/flan-t5-large"
-                                rr = requests.post(hf_text_url, headers={"Authorization": f"Bearer {get_hf_token()}"}, json={"inputs": prompt}, timeout=HF_TIMEOUT)
-                                rr.raise_for_status()
-                                out = rr.json()
-                                if isinstance(out, list) and out and isinstance(out[0], dict) and "generated_text" in out[0]:
-                                    final_answer = out[0]["generated_text"]
-                                else:
-                                    final_answer = str(out)
-                            except Exception as ee:
-                                final_answer = f"[Generation error] {ee}"
-                    else:
-                        try:
-                            hf_text_url = "https://api-inference.huggingface.co/models/google/flan-t5-large"
-                            rr = requests.post(hf_text_url, headers={"Authorization": f"Bearer {get_hf_token()}"}, json={"inputs": prompt}, timeout=HF_TIMEOUT)
-                            rr.raise_for_status()
-                            out = rr.json()
-                            if isinstance(out, list) and out and isinstance(out[0], dict) and "generated_text" in out[0]:
-                                final_answer = out[0]["generated_text"]
-                            else:
-                                final_answer = str(out)
-                        except Exception as ee:
-                            final_answer = f"[Generation error] {ee}"
+                    prompt = f"Memory:\n{mem_text}\n\nContext:\n{retrieved}\n\nQuestion:\n{user_input}\n\nAnswer concisely."
                 else:
-                    # No RAG; simple generation
-                    prompt = f"Question:\n{user_input}\n\nAnswer concisely."
-                    groq_key = get_groq_key()
-                    if groq_key:
+                    prompt = f"Question:\n{user_input}\nAnswer concisely."
+                groq_key = get_groq_key()
+                if groq_key:
+                    try:
+                        r = requests.post(GROQ_API_URL, headers={"Authorization": f"Bearer {groq_key}", "Content-Type":"application/json"},
+                                          json={"model": GROQ_MODEL_DEFAULT, "messages":[{"role":"user","content":prompt}], "max_tokens":512}, timeout=HF_TIMEOUT)
+                        r.raise_for_status()
+                        j = r.json()
+                        choice = j.get("choices",[{}])[0]
+                        text = ""
+                        if isinstance(choice.get("message"), dict):
+                            text = choice["message"].get("content") or ""
+                        else:
+                            text = choice.get("text") or ""
+                        answer_text = text or str(j)
+                    except Exception as e:
+                        answer_text = f"[Groq generation error] {e}"
+                else:
+                    hf_token = get_hf_token()
+                    if hf_token:
                         try:
-                            r = requests.post("https://api.groq.com/openai/v1/chat/completions",
-                                              headers={"Authorization": f"Bearer {groq_key}", "Content-Type":"application/json"},
-                                              json={"model": DEFAULT_GROQ_MODEL, "messages":[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":prompt}], "max_tokens":512},
-                                              timeout=HF_TIMEOUT)
+                            url = f"https://api-inference.huggingface.co/models/{HF_TEXT_MODEL_FALLBACK}"
+                            r = requests.post(url, headers={"Authorization": f"Bearer {hf_token}"}, json={"inputs": prompt}, timeout=HF_TIMEOUT)
                             r.raise_for_status()
-                            data = r.json()
-                            choice = data.get("choices",[{}])[0]
-                            out_text = choice.get("message",{}).get("content") if isinstance(choice.get("message"),dict) else choice.get("text")
-                            final_answer = out_text or str(data)
-                        except Exception as e:
-                            try:
-                                hf_text_url = "https://api-inference.huggingface.co/models/google/flan-t5-large"
-                                rr = requests.post(hf_text_url, headers={"Authorization": f"Bearer {get_hf_token()}"}, json={"inputs": prompt}, timeout=HF_TIMEOUT)
-                                rr.raise_for_status()
-                                out = rr.json()
-                                if isinstance(out, list) and out and isinstance(out[0], dict) and "generated_text" in out[0]:
-                                    final_answer = out[0]["generated_text"]
-                                else:
-                                    final_answer = str(out)
-                            except Exception as ee:
-                                final_answer = f"[Generation error] {ee}"
-                    else:
-                        try:
-                            hf_text_url = "https://api-inference.huggingface.co/models/google/flan-t5-large"
-                            rr = requests.post(hf_text_url, headers={"Authorization": f"Bearer {get_hf_token()}"}, json={"inputs": prompt}, timeout=HF_TIMEOUT)
-                            rr.raise_for_status()
-                            out = rr.json()
+                            out = r.json()
                             if isinstance(out, list) and out and isinstance(out[0], dict) and "generated_text" in out[0]:
-                                final_answer = out[0]["generated_text"]
+                                answer_text = out[0]["generated_text"]
                             else:
-                                final_answer = str(out)
-                        except Exception as ee:
-                            final_answer = f"[Generation error] {ee}"
+                                answer_text = str(out)
+                        except Exception as e:
+                            answer_text = f"[HF text generation error] {e}"
+                    else:
+                        answer_text = "No Groq key or HF token available for generation."
+                st.session_state["messages"].append({"role":"assistant","content": answer_text})
             except Exception as e:
-                final_answer = f"[Unhandled error] {e}"
-
-        st.session_state["messages"].append({"role":"assistant","content": final_answer})
+                st.session_state["messages"].append({"role":"assistant","content": f"[Unhandled error] {e}"})
         st.rerun()
 
 with col2:
@@ -813,12 +656,12 @@ with col2:
             for s in chroma_info["snippets"][:6]:
                 st.markdown(f"- **{s['name']}** — `{s['preview'][:160]}...`")
     else:
-        st.info("No Chroma index. Upload PDFs/TXT and the app will auto-index them.")
+        st.info("No Chroma index found. Upload PDFs/TXT to enable RAG.")
 
     st.markdown("---")
     if uploaded_files and st.button("Index uploaded files (manual)"):
-        with st.spinner("Indexing..."):
-            info = index_uploaded_files(uploaded_files=uploaded_files, hf_resilient=hf_res, chunk_size=int(chunk_size), chunk_overlap=int(chunk_overlap), max_chunks=(None if int(max_chunks)==0 else int(max_chunks)))
+        with st.spinner("Indexing uploaded files..."):
+            info = build_chroma_from_uploads(uploaded_files, HF_EMBED_MODELS, max_chunks=None if int(max_chunks) == 0 else int(max_chunks))
             if info:
                 st.session_state["chroma_info"] = info
                 st.success(f"Indexed {info.get('indexed_chunks')} chunks.")
@@ -831,6 +674,6 @@ with col2:
         st.write(mem)
 
     st.markdown("---")
-    st.caption("Set HF_API_TOKEN and GROQ_API_KEY in Streamlit Secrets (recommended). OCR requires poppler + tesseract installed on the host to work.")
+    st.caption("Notes: For scanned PDFs you need Poppler + Tesseract installed on the server for OCR. Put HF_API_TOKEN / GROQ_API_KEY in Streamlit Secrets for production.")
 
-# End app
+# End of app
