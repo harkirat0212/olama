@@ -606,7 +606,7 @@ with st.sidebar:
         for k in ["messages","chroma_info","last_upload_fp"]:
             if k in st.session_state:
                 del st.session_state[k]
-        st.experimental_rerun()
+        st.rerun()
 
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
@@ -699,7 +699,7 @@ with col1:
                     answer = f"[Generation error] {ee}"
 
             st.session_state["messages"].append({"role":"assistant","content": answer})
-            st.experimental_rerun()
+            st.rerun()
 
     # Text chat
     with st.form("chat_form", clear_on_submit=True):
@@ -800,7 +800,7 @@ with col1:
                 final_answer = f"[Unhandled error] {e}"
 
         st.session_state["messages"].append({"role":"assistant","content": final_answer})
-        st.experimental_rerun()
+        st.rerun()
 
 with col2:
     st.markdown("### RAG & Status")
