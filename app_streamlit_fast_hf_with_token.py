@@ -1,18 +1,18 @@
 # app_streamlit_groq_chroma_hf.py
 """
-Streamlit RAG chatbot (auto-index on upload + OCR fallback)
-- Uses Groq for text generation via OpenAI-compatible endpoint
-- Hugging Face Inference for embeddings & image captioning
-- Chroma (duckdb+parquet) as vector store (new client settings)
-- Auto-indexes uploaded PDFs/TXT automatically once per upload fingerprint
-- OCR fallback for scanned PDFs if pdf2image + pytesseract + poppler are available
-NOTE: Embedded API keys are present as fallbacks; use env vars or Streamlit Secrets in production.
+Streamlit RAG chatbot (auto-index + OCR fallback + robust Chroma)
+- Groq for text generation (OpenAI-compatible endpoint) if GROQ_API_KEY available
+- Hugging Face Inference for embeddings & image captioning (HF_API_TOKEN required)
+- Chroma for vector store; robust constructor with persistent attempt and in-memory fallback
+- Auto-index uploaded files once per fingerprint
+- OCR fallback (pdf2image + pytesseract) if available (requires poppler + tesseract)
+Security: This example contains embedded fallback keys (if provided). Prefer setting HF_API_TOKEN and GROQ_API_KEY
+in Streamlit Secrets or environment variables for production.
 """
 
 import os
 import hashlib
 import tempfile
-import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -22,7 +22,7 @@ import chromadb
 from chromadb.config import Settings
 from pypdf import PdfReader
 
-# Optional OCR imports — only used if available
+# optional OCR libs
 try:
     from pdf2image import convert_from_path, convert_from_bytes
     import pytesseract
@@ -31,21 +31,21 @@ except Exception:
     OCR_AVAILABLE = False
 
 # -------------------------
-# === USER-SUPPLIED KEYS (FALLBACKS) ===
-# You gave these keys — they're used as defaults if env vars are not set.
-# Remove these from code before making repo public if you care about security.
+# USER KEYS (FALLBACKS)
+# Replace or remove these hardcoded fallbacks before public release.
 GROQ_KEY_FALLBACK = "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"
 HF_KEY_FALLBACK = "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"
 # -------------------------
 
 # -------------------------
-# Configuration / Defaults
+# CONFIG
 # -------------------------
 DEFAULT_HF_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_HF_IMAGE_MODEL = "Salesforce/blip-image-captioning-large"
 DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 
-TMP_DIR = Path(os.environ.get("STREAMLIT_CHROMA_DIR", tempfile.gettempdir())) / "chroma_persist"
+# Use a new persist folder name to avoid reusing older DBs
+TMP_DIR = Path(os.environ.get("STREAMLIT_CHROMA_DIR", tempfile.gettempdir())) / "chroma_persist_v3"
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_UPLOADS = 6
@@ -53,12 +53,12 @@ MAX_UPLOAD_MB = 200
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 HF_BATCH_SIZE = 16
-HF_TIMEOUT = 60  # seconds
+HF_TIMEOUT = 60
 
 st.set_page_config(page_title="RAG — Groq + HF + Chroma (Auto-index)", layout="wide")
 
 # -------------------------
-# Helpers: Secrets, HF embeddings, image captioning
+# Helpers: secrets, HF clients
 # -------------------------
 def get_hf_token() -> str:
     token = os.environ.get("HF_API_TOKEN")
@@ -88,12 +88,12 @@ class HFInferenceEmbeddings:
     def __init__(self, model: str = DEFAULT_HF_EMBED_MODEL, timeout: int = HF_TIMEOUT):
         token = get_hf_token()
         if not token:
-            raise RuntimeError("HF_API_TOKEN not set.")
+            raise RuntimeError("HF API token not set (HF_API_TOKEN).")
         self.url = f"https://api-inference.huggingface.co/embeddings/{model}"
         self.headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         self.timeout = timeout
 
-    def _post(self, inputs: List[str]) -> List[List[float]]:
+    def _post(self, inputs: List[str]):
         payload = {"inputs": inputs}
         r = requests.post(self.url, headers=self.headers, json=payload, timeout=self.timeout)
         r.raise_for_status()
@@ -114,7 +114,7 @@ class HFImageCaption:
     def __init__(self, model: str = DEFAULT_HF_IMAGE_MODEL, timeout: int = HF_TIMEOUT):
         token = get_hf_token()
         if not token:
-            raise RuntimeError("HF_API_TOKEN not set.")
+            raise RuntimeError("HF API token not set (HF_API_TOKEN).")
         self.url = f"https://api-inference.huggingface.co/models/{model}"
         self.headers = {"Authorization": f"Bearer {token}"}
         self.timeout = timeout
@@ -138,11 +138,11 @@ class GroqClient:
     def __init__(self, api_key: Optional[str] = None, timeout: int = 60):
         self.api_key = (api_key or get_groq_key())
         if not self.api_key:
-            raise RuntimeError("GROQ_API_KEY not set.")
+            raise RuntimeError("GROQ API key not set (GROQ_API_KEY).")
         self.headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         self.timeout = timeout
 
-    def chat(self, messages: List[Dict[str, str]], model: str = DEFAULT_GROQ_MODEL, max_tokens: int = 512, temperature: float = 0.0) -> str:
+    def chat(self, messages: List[Dict[str,str]], model: str = DEFAULT_GROQ_MODEL, max_tokens: int = 512, temperature: float = 0.0) -> str:
         body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
         r = requests.post(self.ENDPOINT, headers=self.headers, json=body, timeout=self.timeout)
         r.raise_for_status()
@@ -152,13 +152,13 @@ class GroqClient:
             if not choice:
                 return str(res)
             if "message" in choice and isinstance(choice["message"], dict):
-                return choice["message"].get("content", "") or str(choice)
-            return choice.get("text", "") or str(choice)
+                return choice["message"].get("content","") or str(choice)
+            return choice.get("text","") or str(choice)
         except Exception:
             return str(res)
 
 # -------------------------
-# File fingerprinting & chunking
+# file fingerprinting, chunking, OCR
 # -------------------------
 def fingerprint_files(files: List[st.runtime.uploaded_file_manager.UploadedFile]) -> str:
     h = hashlib.sha256()
@@ -187,71 +187,107 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
         start = end - overlap
     return chunks
 
-# -------------------------
-# OCR helper (for scanned PDFs)
-# -------------------------
 def ocr_pdf_to_text_bytes(pdf_path: Path) -> str:
-    """Try OCR using pdf2image + pytesseract. Returns full extracted text or ''."""
     if not OCR_AVAILABLE:
         return ""
-    text_pages = []
+    pages_txt = []
     try:
         images = convert_from_path(str(pdf_path), dpi=300)
         for im in images:
-            txt = pytesseract.image_to_string(im)
-            text_pages.append(txt)
-        return "\n\n".join(text_pages)
+            pages_txt.append(pytesseract.image_to_string(im))
+        return "\n\n".join(pages_txt)
     except Exception:
         try:
             data = pdf_path.read_bytes()
             images = convert_from_bytes(data, dpi=300)
             for im in images:
-                txt = pytesseract.image_to_string(im)
-                text_pages.append(txt)
-            return "\n\n".join(text_pages)
+                pages_txt.append(pytesseract.image_to_string(im))
+            return "\n\n".join(pages_txt)
         except Exception:
             return ""
 
 # -------------------------
-# Chroma helpers (NEW style Settings)
+# Robust Chroma client + collection helpers
 # -------------------------
 def chroma_client(persist_directory: str) -> chromadb.Client:
     """
-    Construct a Chroma client using the new Settings keys.
-    If you previously used an older Chroma DB in the same directory, you may still
-    see migration warnings; in that case either remove the old directory or run
-    the chroma-migrate tool as suggested in the Chroma docs.
+    Try multiple Settings signatures to support different chromadb versions.
+    Fall back to an in-memory client if persistent options fail.
     """
-    settings = Settings(persist_directory=persist_directory, chroma_api_impl="duckdb+parquet")
-    return chromadb.Client(settings)
+    persist_directory = str(persist_directory)
+    tried = []
+    candidates = [
+        {"persist_directory": persist_directory, "chroma_api_impl": "duckdb+parquet"},
+        {"persist_directory": persist_directory, "chroma_db_impl": "duckdb+parquet"},
+        {"persist_directory": persist_directory, "chroma_api_impl": "duckdb"},
+        {"persist_directory": persist_directory, "chroma_db_impl": "duckdb"},
+        {"persist_directory": persist_directory},
+    ]
+    for s in candidates:
+        try:
+            settings = Settings(**s)
+            client = chromadb.Client(settings)
+            # smoke test
+            try:
+                _ = client.list_collections()
+            except Exception:
+                pass
+            st.info(f"Chroma client initialized with settings: {list(s.keys())}")
+            return client
+        except Exception as e:
+            tried.append((s, str(e)))
+            continue
+
+    # fallback to in-memory client
+    try:
+        st.warning("Persistent Chroma initialization failed; falling back to in-memory Chroma (no persistence).")
+        client = chromadb.Client()
+        return client
+    except Exception as e:
+        err = f"Could not initialize any Chroma client. Tried: {tried}. Last error: {e}"
+        st.error(err)
+        raise RuntimeError(err)
 
 def ensure_collection(client: chromadb.Client, name: str):
     try:
-        # new API: get_collection will raise if missing, so create
         return client.get_collection(name=name)
     except Exception:
-        # Create collection - newer versions may support get_or_create param, but keep this generic
-        return client.create_collection(name=name)
+        try:
+            return client.create_collection(name=name)
+        except Exception:
+            # try listing and searching
+            try:
+                cols = client.list_collections()
+                for c in cols:
+                    if isinstance(c, dict) and c.get("name") == name:
+                        return client.get_collection(name=name)
+            except Exception:
+                pass
+            raise RuntimeError(f"Could not create or get collection '{name}'.")
 
+# -------------------------
+# Indexing & query helpers
+# -------------------------
 def index_uploaded_files(uploaded_files, hf_embed_model: str, chunk_size: int, chunk_overlap: int, max_chunks: Optional[int]):
-    """Index uploaded files into a chroma collection and persist. Returns dict or None."""
     if not uploaded_files:
         return None
     fp = fingerprint_files(uploaded_files)
     persist_dir = str(TMP_DIR / fp)
     Path(persist_dir).mkdir(parents=True, exist_ok=True)
 
-    # If older chroma files exist and are from a prior incompatible format,
-    # the client might still log warnings; inform user in UI (no crash).
     try:
         client = chroma_client(persist_dir)
     except Exception as e:
         st.error(f"Could not initialize Chroma client: {e}")
         return None
 
-    col = ensure_collection(client, f"col_{fp}")
+    try:
+        col = ensure_collection(client, f"col_{fp}")
+    except Exception as e:
+        st.error(f"Could not ensure Chroma collection: {e}")
+        return None
 
-    # if already has content, reuse
+    # reuse if already indexed
     try:
         cnt = col.count()
         if cnt and cnt > 0:
@@ -275,7 +311,6 @@ def index_uploaded_files(uploaded_files, hf_embed_model: str, chunk_size: int, c
         with open(target, "wb") as f:
             f.write(uploaded.getbuffer())
 
-        # try pypdf extraction first
         text = ""
         if uploaded.name.lower().endswith(".pdf"):
             try:
@@ -283,18 +318,15 @@ def index_uploaded_files(uploaded_files, hf_embed_model: str, chunk_size: int, c
                 pages = [p.extract_text() or "" for p in reader.pages]
                 text = "\n\n".join(pages).strip()
             except Exception as e:
-                st.info(f"pypdf extraction error for {uploaded.name}: {e}")
+                st.info(f"pypdf error for {uploaded.name}: {e}")
                 text = ""
 
-            # If no text extracted, try OCR fallback (scanned PDF)
             if (not text or not text.strip()) and OCR_AVAILABLE:
-                st.info(f"No text from {uploaded.name} via pypdf — trying OCR (pdf2image + pytesseract)...")
+                st.info(f"No text via pypdf for {uploaded.name}; trying OCR...")
                 try:
                     ocr_text = ocr_pdf_to_text_bytes(target)
                     if ocr_text and ocr_text.strip():
                         text = ocr_text
-                    else:
-                        st.info(f"OCR produced no text for {uploaded.name}.")
                 except Exception as e:
                     st.info(f"OCR error for {uploaded.name}: {e}")
         else:
@@ -307,7 +339,7 @@ def index_uploaded_files(uploaded_files, hf_embed_model: str, chunk_size: int, c
                     text = ""
 
         if not text or not text.strip():
-            st.info(f"No text extracted from {uploaded.name}, skipping.")
+            st.info(f"No text extracted from {uploaded.name}; skipping.")
             continue
 
         chunks = chunk_text(text, chunk_size=chunk_size, overlap=chunk_overlap)
@@ -326,11 +358,10 @@ def index_uploaded_files(uploaded_files, hf_embed_model: str, chunk_size: int, c
         st.info(f"Indexing first {max_chunks} chunks (out of {len(texts)})")
         texts = texts[:max_chunks]; ids = ids[:max_chunks]; metadatas = metadatas[:max_chunks]
 
-    # embeddings via HF
     try:
         hf = HFInferenceEmbeddings(model=hf_embed_model)
     except Exception as e:
-        st.error(f"HF embeddings init error: {e}")
+        st.error(f"HF init error: {e}")
         return None
 
     embeddings = []
@@ -362,7 +393,7 @@ def query_collection(collection: chromadb.api.models.Collection, query: str, hf_
     try:
         hf = HFInferenceEmbeddings(model=hf_embed_model)
     except Exception as e:
-        st.error(f"HF embedding init error: {e}")
+        st.error(f"HF init error: {e}")
         return []
     try:
         qv = hf.embed_query(query)
@@ -370,7 +401,7 @@ def query_collection(collection: chromadb.api.models.Collection, query: str, hf_
         st.error(f"HF embedding error for query: {e}")
         return []
     try:
-        res = collection.query(query_embeddings=[qv], n_results=k, include=["documents", "metadatas", "distances"])
+        res = collection.query(query_embeddings=[qv], n_results=k, include=["documents","metadatas","distances"])
     except Exception as e:
         st.error(f"Chroma query error: {e}")
         return []
@@ -383,7 +414,7 @@ def query_collection(collection: chromadb.api.models.Collection, query: str, hf_
     return docs
 
 # -------------------------
-# Memory helper
+# Simple memory helper
 # -------------------------
 class SimpleMemory:
     def __init__(self, k: int = 4):
@@ -391,10 +422,10 @@ class SimpleMemory:
     def load_memory(self):
         msgs = st.session_state.get("messages", [])
         last = msgs[-self.k:] if msgs else []
-        return [{"type": m.get("role", "assistant"), "content": m.get("content","")} for m in last]
+        return [{"type": m.get("role","assistant"), "content": m.get("content","")} for m in last]
 
 # -------------------------
-# Sidebar & UI (with auto-indexing)
+# UI: sidebar & auto-index
 # -------------------------
 with st.sidebar:
     st.header("Settings")
@@ -412,33 +443,30 @@ with st.sidebar:
     if st.button("Clear conversation & index"):
         for k in ["messages","chroma_info","last_upload_fp"]:
             if k in st.session_state: del st.session_state[k]
-        st.experimental_rerun()
+        st.rerun()
 
-# session init
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
 if "chroma_info" not in st.session_state:
     st.session_state["chroma_info"] = None
 
-# instantiate Groq client (non-blocking)
+# instantiate Groq client if possible (non-fatal)
 groq_client = None
 try:
     groq_client = GroqClient()
-except Exception as e:
-    st.sidebar.warning(f"Groq init warning: {e}")
+except Exception:
+    groq_client = None
 
 st.title("RAG Chat — Groq Llama-3 + HF embeddings + Chroma (Auto-index)")
 
-# -------------------------
-# AUTO-INDEX: if new uploads present and not indexed, index once
-# -------------------------
+# AUTO-INDEX once for a new upload fingerprint
 if uploaded_files and (st.session_state.get("chroma_info") is None):
     try:
         uploaded_fp = fingerprint_files(uploaded_files)
         prev_fp = st.session_state.get("last_upload_fp")
         if uploaded_fp != prev_fp:
             st.session_state["last_upload_fp"] = uploaded_fp
-            with st.spinner("Auto-indexing uploaded files (HF embeddings -> Chroma)..."):
+            with st.spinner("Auto-indexing uploaded files (HF embeddings → Chroma)..."):
                 info = index_uploaded_files(
                     uploaded_files=uploaded_files,
                     hf_embed_model=hf_embed_model,
@@ -450,16 +478,16 @@ if uploaded_files and (st.session_state.get("chroma_info") is None):
                     st.session_state["chroma_info"] = info
                     st.success(f"Auto-indexed {info.get('indexed_chunks')} chunks.")
                 else:
-                    st.error("Auto-indexing failed; check logs / secrets.")
+                    st.error("Auto-indexing failed; check logs or HF/Chroma initialization.")
     except Exception as e:
         st.error(f"Auto-indexing exception: {e}")
 
 # -------------------------
-# Main UI columns
+# Main UI
 # -------------------------
 col1, col2 = st.columns([3,1])
 with col1:
-    # render chat
+    # chat display
     for msg in st.session_state["messages"]:
         role = msg.get("role","assistant")
         content = msg.get("content","")
@@ -468,7 +496,7 @@ with col1:
         else:
             st.markdown(f'<div style="display:flex;justify-content:flex-start"><div style="background:#fff;padding:10px;border-radius:10px;max-width:80%">{content}</div></div>', unsafe_allow_html=True)
 
-    # image analysis
+    # image analyze
     if image_file:
         st.image(image_file, use_column_width=True)
         q_img = st.text_input("Ask something about this image (optional):")
@@ -479,9 +507,8 @@ with col1:
                     hf_img = HFImageCaption(model=hf_image_model)
                     caption = hf_img.caption(img_bytes)
                 except Exception as e:
-                    caption = f"[Image captioning error] {e}"
+                    caption = f"[Image caption error] {e}"
             prompt = f"Image caption: {caption}\n\nQuestion: {q_img}\nAnswer concisely."
-            answer = None
             if groq_client:
                 try:
                     messages = [{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":prompt}]
@@ -490,9 +517,9 @@ with col1:
                     answer = f"[Groq error] {e}"
             else:
                 try:
-                    hf_text_url = f"https://api-inference.huggingface.co/models/google/flan-t5-large"
+                    hf_text_url = "https://api-inference.huggingface.co/models/google/flan-t5-large"
                     hf_headers = {"Authorization": f"Bearer {get_hf_token()}"}
-                    resp = requests.post(hf_text_url, headers=hf_headers, json={"inputs": prompt, "options":{"wait_for_model": True}}, timeout=HF_TIMEOUT)
+                    resp = requests.post(hf_text_url, headers=hf_headers, json={"inputs": prompt}, timeout=HF_TIMEOUT)
                     resp.raise_for_status()
                     out = resp.json()
                     if isinstance(out, list) and out and isinstance(out[0], dict) and "generated_text" in out[0]:
@@ -502,9 +529,9 @@ with col1:
                 except Exception as e:
                     answer = f"[HF fallback error] {e}"
             st.session_state["messages"].append({"role":"assistant","content":answer})
-            st.experimental_rerun()
+            st.rerun()
 
-    # chat form
+    # text chat form
     with st.form("chat_form", clear_on_submit=True):
         user_input = st.text_area("Type your message:", height=140)
         send = st.form_submit_button("Send")
@@ -515,6 +542,7 @@ with col1:
             try:
                 memory = SimpleMemory(k=memory_window)
                 chroma_info = st.session_state.get("chroma_info")
+                final_answer = ""
                 if chroma_info and chroma_info.get("collection"):
                     collection = chroma_info["collection"]
                     docs = query_collection(collection, user_input, hf_embed_model=hf_embed_model, k=3)
@@ -524,7 +552,6 @@ with col1:
                     mem_text = "\n".join(f"{m.get('type')}: {m.get('content')}" for m in mem_items) if mem_items else ""
                     system_prompt = "You are a helpful assistant. Use retrieved documents to answer concisely and accurately. If citing, mention the source filename."
                     user_prompt = f"Conversation memory:\n{mem_text}\n\nRetrieved docs:\n{context}\n\nQuestion:\n{user_input}\n\nAnswer concisely."
-                    final_answer = ""
                     if groq_client:
                         messages = [{"role":"system","content":system_prompt},{"role":"user","content":user_prompt}]
                         try:
@@ -533,9 +560,9 @@ with col1:
                             final_answer = f"[Groq error] {e}"
                     else:
                         try:
-                            hf_text_url = f"https://api-inference.huggingface.co/models/google/flan-t5-large"
+                            hf_text_url = "https://api-inference.huggingface.co/models/google/flan-t5-large"
                             hf_headers = {"Authorization": f"Bearer {get_hf_token()}"}
-                            resp = requests.post(hf_text_url, headers=hf_headers, json={"inputs": user_prompt, "options":{"wait_for_model": True}}, timeout=HF_TIMEOUT)
+                            resp = requests.post(hf_text_url, headers=hf_headers, json={"inputs": user_prompt}, timeout=HF_TIMEOUT)
                             resp.raise_for_status()
                             out = resp.json()
                             if isinstance(out, list) and out and isinstance(out[0], dict) and "generated_text" in out[0]:
@@ -554,9 +581,9 @@ with col1:
                             final_answer = f"[Groq error] {e}"
                     else:
                         try:
-                            hf_text_url = f"https://api-inference.huggingface.co/models/google/flan-t5-large"
+                            hf_text_url = "https://api-inference.huggingface.co/models/google/flan-t5-large"
                             hf_headers = {"Authorization": f"Bearer {get_hf_token()}"}
-                            resp = requests.post(hf_text_url, headers=hf_headers, json={"inputs": prompt, "options":{"wait_for_model": True}}, timeout=HF_TIMEOUT)
+                            resp = requests.post(hf_text_url, headers=hf_headers, json={"inputs": prompt}, timeout=HF_TIMEOUT)
                             resp.raise_for_status()
                             out = resp.json()
                             if isinstance(out, list) and out and isinstance(out[0], dict) and "generated_text" in out[0]:
@@ -569,7 +596,7 @@ with col1:
                 final_answer = f"[Unhandled error] {e}"
 
         st.session_state["messages"].append({"role":"assistant","content": final_answer})
-        st.experimental_rerun()
+        st.rerun()
 
 with col2:
     st.markdown("### RAG & Status")
@@ -582,7 +609,7 @@ with col2:
             for s in chroma_info["snippets"][:6]:
                 st.markdown(f"- **{s['name']}** — `{s['preview'][:160]}...`")
     else:
-        st.info("No Chroma index. Upload files and the app will auto-index them, or click 'Index uploaded files' below.")
+        st.info("No Chroma index. Upload files and the app will auto-index them (or click 'Index uploaded files').")
 
     st.markdown("---")
     if uploaded_files and st.button("Index uploaded files (HF embeddings -> Chroma)"):
@@ -600,4 +627,6 @@ with col2:
         st.write(mem)
 
     st.markdown("---")
-    st.caption("Set HF_API_TOKEN and GROQ_API_KEY in Streamlit Secrets (recommended). If you have an old Chroma DB in the same persist directory, remove or migrate it (chroma-migrate) to silence migration warnings.")
+    st.caption("Set HF_API_TOKEN and GROQ_API_KEY in Streamlit Secrets or environment variables (recommended). OCR requires poppler + tesseract on the host to work.")
+
+# End of file
