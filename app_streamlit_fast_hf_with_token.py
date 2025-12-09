@@ -438,7 +438,7 @@ with st.sidebar:
     if st.button("Clear conversation & index"):
         for k in ["messages", "chroma_info", "last_upload_fp"]:
             if k in st.session_state: del st.session_state[k]
-        st.experimental_rerun()
+        st.rerun()
 
 if "messages" not in st.session_state: st.session_state["messages"] = []
 if "chroma_info" not in st.session_state: st.session_state["chroma_info"] = None
@@ -514,7 +514,7 @@ with col1:
                 # fallback static
                 answer = f"[Answer generated locally] Based on caption: {caption}\n\nQ: {q_img}\nA: (short answer)"
             st.session_state["messages"].append({"role":"assistant","content": answer})
-            st.experimental_rerun()
+            st.rerun()
 
     # Text chat form
     with st.form("chat_form", clear_on_submit=True):
@@ -548,7 +548,7 @@ with col1:
             else:
                 reply = "No RAG index loaded. Upload PDFs/TXT in the sidebar to enable RAG."
             st.session_state["messages"].append({"role":"assistant","content": reply})
-            st.experimental_rerun()
+            st.rerun()
 
 with col2:
     st.markdown("### Status")
