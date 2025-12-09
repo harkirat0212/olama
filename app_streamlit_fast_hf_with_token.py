@@ -1,11 +1,10 @@
-# app_streamlit_final.py
+# app_streamlit_final_v2.py
 """
-Final deployable Streamlit app:
-- Conversational RAG (Chroma) + Image analysis + PDF/TXT extraction + OCR fallback
-- Uses HF Inference API first, with local fallbacks if installed
-- Uses GROQ if GROQ key is set (or fallback provided)
-- Caches heavy resources with @st.cache_resource
-- Put HF_API_TOKEN / GROQ_API_KEY in Streamlit Secrets for production
+Updated final Streamlit app with more robust embedding backend logic.
+- Prioritizes local sentence-transformers if available.
+- Then tries Hugging Face InferenceClient.embeddings (requires HF token).
+- Then tries HF HTTP embeddings endpoint as fallback.
+- Includes clear error messages when embedding backends fail.
 """
 
 import os
@@ -24,14 +23,15 @@ from PIL import Image
 import chromadb
 from chromadb.config import Settings
 
-# Graceful optional imports (OCR / local models)
+# Graceful optional imports
 OCR_AVAILABLE = False
 TRANSFORMERS_AVAILABLE = False
 LOCAL_S2_AVAILABLE = False
-try:
-    from pdf2image import convert_from_bytes, convert_from_path
-    import pytesseract
+HUGGINGFACE_HUB_AVAILABLE = False
 
+try:
+    from pdf2image import convert_from_bytes
+    import pytesseract
     OCR_AVAILABLE = True
 except Exception:
     OCR_AVAILABLE = False
@@ -48,8 +48,14 @@ try:
 except Exception:
     LOCAL_S2_AVAILABLE = False
 
+try:
+    from huggingface_hub import InferenceClient
+    HUGGINGFACE_HUB_AVAILABLE = True
+except Exception:
+    HUGGINGFACE_HUB_AVAILABLE = False
+
 # -------------------------
-# FALLBACK KEYS (you provided)
+# FALLBACK KEYS (user provided)
 # -------------------------
 GROQ_KEY_FALLBACK = "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"
 HF_KEY_FALLBACK = "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"
@@ -58,20 +64,19 @@ HF_KEY_FALLBACK = "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"
 # CONFIG
 # -------------------------
 HF_TIMEOUT = 60
-TMP_BASE = Path(tempfile.gettempdir()) / "streamlit_rag_chroma_final"
+TMP_BASE = Path(tempfile.gettempdir()) / "streamlit_rag_chroma_final_v2"
 TMP_BASE.mkdir(parents=True, exist_ok=True)
 MAX_UPLOAD_MB = 200
 BATCH_SIZE = 16
 
-# Candidate HF models (tried in order)
 HF_EMBED_MODELS = ["intfloat/e5-small", "sentence-transformers/all-MiniLM-L6-v2"]
 HF_IMAGE_MODELS = ["nlpconnect/vit-gpt2-image-captioning", "Salesforce/blip-image-captioning-base"]
-HF_TEXT_MODEL_FALLBACK = "google/flan-t5-large"  # HF text generation fallback
+HF_TEXT_MODEL_FALLBACK = "google/flan-t5-large"
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL_DEFAULT = "llama-3.3-70b-versatile"  # used only if GROQ key available
+GROQ_MODEL_DEFAULT = "llama-3.3-70b-versatile"
 
-st.set_page_config(page_title="RAG Chat — Final", layout="wide")
+st.set_page_config(page_title="RAG Chat — Final v2", layout="wide")
 
 # -------------------------
 # Tokens (secrets -> env -> fallback)
@@ -97,33 +102,34 @@ def get_groq_key() -> Optional[str]:
     return GROQ_KEY_FALLBACK
 
 # -------------------------
-# Cached clients & local models
+# cached clients & local models
 # -------------------------
 @st.cache_resource
-def get_hf_inference_client():
+def get_hf_inference_client_cached():
     token = get_hf_token()
     if not token:
         return None
+    if not HUGGINGFACE_HUB_AVAILABLE:
+        return None
     try:
-        from huggingface_hub import InferenceClient
         return InferenceClient(token=token)
     except Exception:
         return None
 
 @st.cache_resource
-def get_local_sentence_transformer(model_name="all-MiniLM-L6-v2"):
+def get_local_sentence_transformer_cached(model_name="all-MiniLM-L6-v2"):
     if not LOCAL_S2_AVAILABLE:
         raise RuntimeError("sentence-transformers not installed on server.")
     return SentenceTransformer(model_name)
 
 @st.cache_resource
-def get_local_caption_pipeline(model_name="nlpconnect/vit-gpt2-image-captioning"):
+def get_local_caption_pipeline_cached(model_name="nlpconnect/vit-gpt2-image-captioning"):
     if not TRANSFORMERS_AVAILABLE:
         raise RuntimeError("transformers not installed on server.")
     return pipeline("image-to-text", model=model_name, device=-1)
 
 # -------------------------
-# Chroma helper (tries a few constructors; falls back to in-memory)
+# Chroma client helper
 # -------------------------
 def make_chroma_client(persist_directory: Optional[str] = None) -> chromadb.Client:
     persist_directory = str(persist_directory) if persist_directory else None
@@ -139,7 +145,7 @@ def make_chroma_client(persist_directory: Optional[str] = None) -> chromadb.Clie
         try:
             settings = Settings(**cfg)
             client = chromadb.Client(settings)
-            _ = client.list_collections()  # quick check
+            _ = client.list_collections()
             st.info(f"Chroma client initialized with settings: {list(cfg.keys()) or ['default']}")
             return client
         except Exception as e:
@@ -186,7 +192,6 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[st
 # PDF extraction (pypdf -> OCR)
 # -------------------------
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
-    # Try pypdf extraction
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         pages = [p.extract_text() or "" for p in reader.pages]
@@ -197,8 +202,6 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
         st.info("pypdf returned no text (likely image-only PDF).")
     except Exception as e:
         st.info(f"pypdf extraction error: {e}")
-
-    # OCR fallback via pdf2image + pytesseract
     if OCR_AVAILABLE:
         try:
             images = convert_from_bytes(pdf_bytes, dpi=300)
@@ -217,7 +220,7 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     return ""
 
 # -------------------------
-# Image caption / OCR (HF -> local -> OCR)
+# Image caption / OCR
 # -------------------------
 def hf_http_image_caption(model: str, image_bytes: bytes) -> Optional[str]:
     token = get_hf_token()
@@ -242,8 +245,7 @@ def hf_http_image_caption(model: str, image_bytes: bytes) -> Optional[str]:
         return None
 
 def caption_image_resilient(image_bytes: bytes, candidate_models: List[str]) -> str:
-    # Try HF InferenceClient if available
-    hf_client = get_hf_inference_client()
+    hf_client = get_hf_inference_client_cached()
     if hf_client:
         for model in candidate_models:
             try:
@@ -256,16 +258,14 @@ def caption_image_resilient(image_bytes: bytes, candidate_models: List[str]) -> 
                     return resp[0]["generated_text"]
             except Exception:
                 continue
-    # Try HF HTTP endpoints
     for model in candidate_models:
         out = hf_http_image_caption(model, image_bytes)
         if out:
             st.info(f"Image caption via HF HTTP endpoint (model={model})")
             return out
-    # Local transformers pipeline
     if TRANSFORMERS_AVAILABLE:
         try:
-            pipe = get_local_caption_pipeline(candidate_models[0])
+            pipe = get_local_caption_pipeline_cached(candidate_models[0])
             pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
             res = pipe(pil)
             if isinstance(res, list) and res and isinstance(res[0], dict):
@@ -279,7 +279,6 @@ def caption_image_resilient(image_bytes: bytes, candidate_models: List[str]) -> 
                 return res[0]
         except Exception as e:
             st.info(f"Local transformers caption error: {e}")
-    # OCR fallback (pytesseract)
     if OCR_AVAILABLE:
         try:
             pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -290,11 +289,10 @@ def caption_image_resilient(image_bytes: bytes, candidate_models: List[str]) -> 
             st.info("Image OCR returned empty text.")
         except Exception as e:
             st.info(f"Image OCR error: {e}")
-
-    raise RuntimeError("Image captioning/OCR failed. Please provide HF token or install transformers/pytesseract on the server.")
+    raise RuntimeError("Image captioning/OCR failed. Ensure HF token is set or install transformers/pytesseract on the server.")
 
 # -------------------------
-# Embeddings (HF -> local fallback)
+# Embeddings (robust)
 # -------------------------
 def hf_http_embeddings(model: str, texts: List[str]) -> Optional[List[List[float]]]:
     token = get_hf_token()
@@ -323,34 +321,47 @@ def hf_http_embeddings(model: str, texts: List[str]) -> Optional[List[List[float
         return None
 
 def embed_texts_resilient(texts: List[str], candidate_models: List[str]) -> List[List[float]]:
-    # Try HF HTTP endpoints
-    for m in candidate_models:
-        out = hf_http_embeddings(m, texts)
-        if out:
-            st.info(f"Embeddings via HF endpoint (model={m})")
-            return out
-    # Try HF client
-    hf_client = get_hf_inference_client()
-    if hf_client:
-        for m in candidate_models:
-            try:
-                out = hf_client.embeddings(model=m, inputs=texts)
-                if out and isinstance(out, list):
-                    st.info(f"Embeddings via HF client (model={m})")
-                    return out
-            except Exception:
-                continue
-    # Local fallback
+    # 1) Local sentence-transformers if installed
     if LOCAL_S2_AVAILABLE:
         try:
             model_name = candidate_models[0] if candidate_models else "all-MiniLM-L6-v2"
-            m = get_local_sentence_transformer(model_name)
+            st.info(f"Using local sentence-transformers model: {model_name}")
+            m = get_local_sentence_transformer_cached(model_name)
             arr = m.encode(texts, show_progress_bar=False, batch_size=BATCH_SIZE, convert_to_numpy=True)
-            st.info("Embeddings via local sentence-transformers.")
             return [v.tolist() for v in arr]
         except Exception as e:
-            raise RuntimeError(f"All embedding backends failed; local fallback error: {e}")
-    raise RuntimeError("All embedding backends failed and no local model available.")
+            st.info(f"Local sentence-transformers failed: {e}")
+
+    # 2) HuggingFace InferenceClient.embeddings()
+    hf_client = get_hf_inference_client_cached()
+    if hf_client:
+        for m in candidate_models:
+            try:
+                st.info(f"Trying HF InferenceClient embeddings with model: {m}")
+                out = hf_client.embeddings(model=m, inputs=texts)
+                if out and isinstance(out, list):
+                    return out
+            except Exception as e:
+                st.info(f"HF InferenceClient embeddings failed for {m}: {e}")
+                continue
+
+    # 3) HF HTTP embeddings endpoint
+    for m in candidate_models:
+        st.info(f"Trying HF HTTP embeddings endpoint with model: {m}")
+        out = hf_http_embeddings(m, texts)
+        if out:
+            return out
+
+    # If we arrived here, all backends failed
+    # Provide clear instructions to user in the raised error
+    raise RuntimeError(
+        "All embedding backends failed.\n"
+        "Possible fixes:\n"
+        " - Set a valid HF API token in Streamlit Secrets as HF_API_TOKEN (or env var).\n"
+        " - Or install 'sentence-transformers' locally (heavy) so the app can compute embeddings on the host.\n"
+        " - Check network/firewall and HF token permissions.\n"
+        "See app logs for details."
+    )
 
 # -------------------------
 # Build Chroma from uploads
@@ -366,7 +377,6 @@ def build_chroma_from_uploads(uploaded_files: List[st.runtime.uploaded_file_mana
     except Exception as e:
         st.error(f"Chroma init error: {e}")
         return None
-
     try:
         try:
             col = client.get_collection(name=f"col_{fp}")
@@ -376,7 +386,6 @@ def build_chroma_from_uploads(uploaded_files: List[st.runtime.uploaded_file_mana
         st.error(f"Chroma collection error: {e}")
         return None
 
-    # If already indexed, skip
     try:
         if col.count() and col.count() > 0:
             st.success(f"Collection already indexed with {col.count()} items.")
@@ -444,7 +453,6 @@ def build_chroma_from_uploads(uploaded_files: List[st.runtime.uploaded_file_mana
         st.error(f"Embedding computation failed: {e}")
         return None
 
-    # add to chroma
     try:
         col.add(documents=texts, metadatas=metadatas, ids=ids, embeddings=embeddings)
         try:
@@ -485,8 +493,8 @@ def query_chroma_collection(collection, query_text: str, candidate_embed_models:
 # -------------------------
 with st.sidebar:
     st.header("Settings")
-    st.markdown("**HF token**: set `HF_API_TOKEN` in Streamlit Secrets or env (recommended).")
-    st.markdown("**GROQ key**: set `GROQ_API_KEY` in Secrets/env to use Groq (optional).")
+    st.markdown("HF token: set `HF_API_TOKEN` in Streamlit Secrets or env (recommended).")
+    st.markdown("GROQ key: set `GROQ_API_KEY` in Secrets/env to use Groq (optional).")
     uploaded_files = st.file_uploader("Upload PDF / TXT (multiple)", type=["pdf","txt"], accept_multiple_files=True)
     image_file = st.file_uploader("Upload image (optional)", type=["png","jpg","jpeg"])
     st.markdown("---")
@@ -498,16 +506,24 @@ with st.sidebar:
         for k in ["messages","chroma_info","last_fp"]:
             if k in st.session_state:
                 del st.session_state[k]
-        st.rerun()
+        st.experimental_rerun()
 
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
 if "chroma_info" not in st.session_state:
     st.session_state["chroma_info"] = None
 
-st.title("RAG Chat — Final (HF Inference + OCR)")
+# Show embedding backend availability banner
+colA, colB, colC = st.columns(3)
+with colA:
+    st.write("Local S2:", "Yes" if LOCAL_S2_AVAILABLE else "No")
+with colB:
+    st.write("HF InferenceClient:", "Yes" if HUGGINGFACE_HUB_AVAILABLE else "No")
+with colC:
+    st.write("OCR:", "Yes" if OCR_AVAILABLE else "No")
 
-# Auto-index uploaded files (once per fingerprint)
+st.title("RAG Chat — Final v2 (robust embeddings)")
+
 if uploaded_files and st.session_state.get("chroma_info") is None:
     try:
         new_fp = fingerprint_files(uploaded_files)
@@ -528,7 +544,6 @@ if uploaded_files and st.session_state.get("chroma_info") is None:
 col1, col2 = st.columns([3,1])
 
 with col1:
-    # display messages
     for m in st.session_state["messages"]:
         role = m.get("role","assistant")
         content = m.get("content","")
@@ -537,7 +552,6 @@ with col1:
         else:
             st.markdown(f'<div style="display:flex;justify-content:flex-start"><div style="background:#fff;padding:10px;border-radius:10px;max-width:80%">{content}</div></div>', unsafe_allow_html=True)
 
-    # image analyze
     if image_file:
         st.markdown("### Uploaded Image")
         st.image(image_file, use_column_width=True)
@@ -549,9 +563,7 @@ with col1:
                     caption = caption_image_resilient(img_bytes, HF_IMAGE_MODELS)
                 except Exception as e:
                     caption = f"[Caption/OCR error] {e}"
-            # Generate answer using Groq if available, else HF text fallback
-            question = q_img.strip()
-            prompt = f"Image caption / OCR:\n{caption}\n\nQuestion: {question or 'Describe the image.'}\nAnswer concisely."
+            prompt = f"Image caption / OCR:\n{caption}\n\nQuestion: {q_img or 'Describe the image.'}\nAnswer concisely."
             groq_key = get_groq_key()
             answer = ""
             if groq_key:
@@ -586,9 +598,8 @@ with col1:
                 else:
                     answer = "No HF token or Groq key available for text generation."
             st.session_state["messages"].append({"role":"assistant","content": f"🖼 Caption/OCR:\n{caption}\n\nAnswer:\n{answer}"})
-            st.rerun()
+            st.experimental_rerun()
 
-    # Text chat
     with st.form("chat_form", clear_on_submit=True):
         user_input = st.text_area("Type your message:", height=140)
         send = st.form_submit_button("Send")
@@ -643,7 +654,7 @@ with col1:
                 st.session_state["messages"].append({"role":"assistant","content": answer_text})
             except Exception as e:
                 st.session_state["messages"].append({"role":"assistant","content": f"[Unhandled error] {e}"})
-        st.rerun()
+        st.experimental_rerun()
 
 with col2:
     st.markdown("### RAG & Status")
@@ -674,6 +685,4 @@ with col2:
         st.write(mem)
 
     st.markdown("---")
-    st.caption("Notes: For scanned PDFs you need Poppler + Tesseract installed on the server for OCR. Put HF_API_TOKEN / GROQ_API_KEY in Streamlit Secrets for production.")
-
-# End of app
+    st.caption("Notes: If embedding computation fails, set HF_API_TOKEN in Streamlit Secrets (or install sentence-transformers locally). For scanned PDFs, Poppler + Tesseract required on the host for OCR.")
