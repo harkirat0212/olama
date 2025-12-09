@@ -1,15 +1,14 @@
 streamlit>=1.25.0
-requests
-ollama
+requests>=2.28.0
+ollama>=0.4.0
 langchain==0.1.17
 langchain-core==0.1.53
 langchain-community==0.0.29
 langchain-ollama==0.2.2
 chromadb==0.5.0
-pypdf
-pypdf2
+pypdf>=3.6.0
+sentence-transformers>=2.2.2
 tiktoken
-sentence-transformers
-pdf2image
-pytesseract
 numpy
+pdf2image   # optional, only if you want OCR fallback
+pytesseract # optional, only if you want OCR fallback
