@@ -1,9 +1,9 @@
 # app_streamlit_groq_chroma_hf.py
 """
 Streamlit RAG chatbot (auto-index on upload + OCR fallback)
-- Groq for text generation (OpenAI-compatible endpoint)
+- Uses Groq for text generation via OpenAI-compatible endpoint
 - Hugging Face Inference for embeddings & image captioning
-- Chroma for vector store (duckdb+parquet)
+- Chroma (duckdb+parquet) as vector store (new client settings)
 - Auto-indexes uploaded PDFs/TXT automatically once per upload fingerprint
 - OCR fallback for scanned PDFs if pdf2image + pytesseract + poppler are available
 NOTE: Embedded API keys are present as fallbacks; use env vars or Streamlit Secrets in production.
@@ -196,14 +196,12 @@ def ocr_pdf_to_text_bytes(pdf_path: Path) -> str:
         return ""
     text_pages = []
     try:
-        # convert_from_path may need poppler; convert_from_bytes can use in-memory bytes if available
         images = convert_from_path(str(pdf_path), dpi=300)
         for im in images:
             txt = pytesseract.image_to_string(im)
             text_pages.append(txt)
         return "\n\n".join(text_pages)
     except Exception:
-        # fallback to convert_from_bytes
         try:
             data = pdf_path.read_bytes()
             images = convert_from_bytes(data, dpi=300)
@@ -215,15 +213,24 @@ def ocr_pdf_to_text_bytes(pdf_path: Path) -> str:
             return ""
 
 # -------------------------
-# Chroma helpers (persist per fingerprint)
+# Chroma helpers (NEW style Settings)
 # -------------------------
 def chroma_client(persist_directory: str) -> chromadb.Client:
-    return chromadb.Client(Settings(persist_directory=persist_directory, chroma_db_impl="duckdb+parquet"))
+    """
+    Construct a Chroma client using the new Settings keys.
+    If you previously used an older Chroma DB in the same directory, you may still
+    see migration warnings; in that case either remove the old directory or run
+    the chroma-migrate tool as suggested in the Chroma docs.
+    """
+    settings = Settings(persist_directory=persist_directory, chroma_api_impl="duckdb+parquet")
+    return chromadb.Client(settings)
 
 def ensure_collection(client: chromadb.Client, name: str):
     try:
+        # new API: get_collection will raise if missing, so create
         return client.get_collection(name=name)
     except Exception:
+        # Create collection - newer versions may support get_or_create param, but keep this generic
         return client.create_collection(name=name)
 
 def index_uploaded_files(uploaded_files, hf_embed_model: str, chunk_size: int, chunk_overlap: int, max_chunks: Optional[int]):
@@ -233,7 +240,15 @@ def index_uploaded_files(uploaded_files, hf_embed_model: str, chunk_size: int, c
     fp = fingerprint_files(uploaded_files)
     persist_dir = str(TMP_DIR / fp)
     Path(persist_dir).mkdir(parents=True, exist_ok=True)
-    client = chroma_client(persist_directory=persist_dir)
+
+    # If older chroma files exist and are from a prior incompatible format,
+    # the client might still log warnings; inform user in UI (no crash).
+    try:
+        client = chroma_client(persist_dir)
+    except Exception as e:
+        st.error(f"Could not initialize Chroma client: {e}")
+        return None
+
     col = ensure_collection(client, f"col_{fp}")
 
     # if already has content, reuse
@@ -273,7 +288,7 @@ def index_uploaded_files(uploaded_files, hf_embed_model: str, chunk_size: int, c
 
             # If no text extracted, try OCR fallback (scanned PDF)
             if (not text or not text.strip()) and OCR_AVAILABLE:
-                st.info(f"No text from {uploaded.name} via pypdf — trying OCR (pdf2image+pytesseract)...")
+                st.info(f"No text from {uploaded.name} via pypdf — trying OCR (pdf2image + pytesseract)...")
                 try:
                     ocr_text = ocr_pdf_to_text_bytes(target)
                     if ocr_text and ocr_text.strip():
@@ -397,7 +412,7 @@ with st.sidebar:
     if st.button("Clear conversation & index"):
         for k in ["messages","chroma_info","last_upload_fp"]:
             if k in st.session_state: del st.session_state[k]
-        st.rerun()
+        st.experimental_rerun()
 
 # session init
 if "messages" not in st.session_state:
@@ -487,7 +502,7 @@ with col1:
                 except Exception as e:
                     answer = f"[HF fallback error] {e}"
             st.session_state["messages"].append({"role":"assistant","content":answer})
-            st.rerun()
+            st.experimental_rerun()
 
     # chat form
     with st.form("chat_form", clear_on_submit=True):
@@ -554,7 +569,7 @@ with col1:
                 final_answer = f"[Unhandled error] {e}"
 
         st.session_state["messages"].append({"role":"assistant","content": final_answer})
-        st.rerun()
+        st.experimental_rerun()
 
 with col2:
     st.markdown("### RAG & Status")
@@ -585,6 +600,4 @@ with col2:
         st.write(mem)
 
     st.markdown("---")
-    st.caption("Set HF_API_TOKEN and GROQ_API_KEY in Streamlit Secrets (recommended). OCR requires pdf2image + pytesseract + poppler installed on the host to work.")
-
-# End of file
+    st.caption("Set HF_API_TOKEN and GROQ_API_KEY in Streamlit Secrets (recommended). If you have an old Chroma DB in the same persist directory, remove or migrate it (chroma-migrate) to silence migration warnings.")
