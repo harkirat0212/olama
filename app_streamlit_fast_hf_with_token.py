@@ -1,7 +1,12 @@
-# app_streamlit_fast_hf_with_token.py
+# app_streamlit_fast_hf_updated_rag.py
 """
-Fast RAG Streamlit app using Hugging Face Inference API for embeddings.
-Index-on-demand, persistent Chroma per-upload fingerprint, Ollama LLMs for chat & vision.
+Streamlit RAG app (HF Inference embeddings) — updated to avoid langchain.chains dependency.
+Features:
+- HF Inference API for embeddings (fast in-cloud). Provide HF_API_TOKEN in env or use embedded fallback.
+- Index-on-demand (click "Index uploaded files").
+- Persistent per-upload Chroma DB reuse.
+- Simple RAG implementation (retriever + prompt + ChatOllama) instead of LangChain's ConversationalRetrievalChain.
+- Image analysis via Ollama vision model.
 WARNING: This file contains an embedded HF token fallback. Keep private.
 """
 
@@ -16,13 +21,17 @@ from typing import List, Dict, Any
 import requests
 import streamlit as st
 
-# Ollama & LangChain imports
+# Ollama & LangChain-ish imports
 import ollama
 from langchain_ollama import ChatOllama
-#from langchain.prompts import PromptTemplate
+
+# Use PromptTemplate from langchain_core for compatibility
 from langchain_core.prompts import PromptTemplate
-from langchain.chains import ConversationalRetrievalChain
+
+# Memory import (keep same as earlier usage)
 from langchain.memory import ConversationBufferWindowMemory
+
+# Document loaders / splitters / vectorstore
 from langchain.document_loaders import PyPDFLoader, TextLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import Chroma
@@ -34,9 +43,6 @@ from langchain.schema import Document
 HF_TOKEN_FALLBACK = "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"
 
 def get_hf_token() -> str:
-    """
-    Prefer environment variable HF_API_TOKEN; otherwise fall back to embedded token.
-    """
     token = os.environ.get("HF_API_TOKEN")
     if token and token.strip():
         return token.strip()
@@ -45,7 +51,7 @@ def get_hf_token() -> str:
 # -------------------------
 # CONFIG
 # -------------------------
-st.set_page_config(page_title="Fast RAG (HF Inference)", layout="wide")
+st.set_page_config(page_title="Fast RAG — Updated", layout="wide")
 TMP_DIR = Path(os.environ.get("STREAMLIT_CHROMA_DIR", tempfile.gettempdir())) / "chroma_persist"
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -54,17 +60,13 @@ MAX_UPLOAD_MB = 100
 DEFAULT_CHUNK_SIZE = 1600
 DEFAULT_CHUNK_OVERLAP = 200
 DEFAULT_MAX_CHUNKS = 1200
-HF_BATCH_SIZE = 16  # batch size for HF inference
+HF_BATCH_SIZE = 16
 HF_TIMEOUT = 60
 
 # -------------------------
 # HF Inference wrapper
 # -------------------------
 class HFInferenceEmbeddings:
-    """
-    Minimal wrapper to call HF Inference API embeddings endpoint.
-    Uses get_hf_token() to obtain token (env first, then fallback).
-    """
     def __init__(self, model: str = "sentence-transformers/all-MiniLM-L6-v2"):
         token = get_hf_token()
         if not token:
@@ -90,7 +92,7 @@ class HFInferenceEmbeddings:
         return self._post([text])[0]
 
 # -------------------------
-# CACHED LLMS
+# Cached LLMs
 # -------------------------
 @st.cache_resource
 def get_llms(text_model: str = "llama3", vision_model: str = "moondream"):
@@ -99,7 +101,7 @@ def get_llms(text_model: str = "llama3", vision_model: str = "moondream"):
     return text_llm, vision_llm
 
 # -------------------------
-# HELPERS
+# Helpers
 # -------------------------
 def fingerprint_files(files: List[st.runtime.uploaded_file_manager.UploadedFile]) -> str:
     h = hashlib.sha256()
@@ -120,38 +122,30 @@ def chroma_path_for_fp(fp: str) -> Path:
     return p
 
 # -------------------------
-# INGEST & INDEX (HF Inference)
+# Ingest & index (HF Inference)
 # -------------------------
-def ingest_files_to_chroma(
-    uploaded_files,
-    hf_embed_model: str,
-    chunk_size: int,
-    chunk_overlap: int,
-    max_chunks: int,
-):
+def ingest_files_to_chroma(uploaded_files, hf_embed_model: str, chunk_size: int, chunk_overlap: int, max_chunks: int):
     if not uploaded_files:
         return None
 
     fp = fingerprint_files(uploaded_files)
     chroma_dir = chroma_path_for_fp(fp)
 
-    # If chroma exists and looks valid, reuse it
+    # reuse existing chroma if present
     if any(chroma_dir.iterdir()):
         try:
             vectordb = Chroma(persist_directory=str(chroma_dir))
             retriever = vectordb.as_retriever(search_kwargs={"k": 3})
             return {"retriever": retriever, "chroma_path": str(chroma_dir), "chunks_indexed": None}
         except Exception:
-            # continue to rebuild
             pass
 
-    docs = []
+    docs: List[Document] = []
     snippets = []
     raw_dir = chroma_dir / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
 
     for uploaded in uploaded_files[:MAX_UPLOADS]:
-        # size guard
         try:
             size = getattr(uploaded, "size", None) or len(uploaded.getbuffer())
         except Exception:
@@ -165,7 +159,7 @@ def ingest_files_to_chroma(
             f.write(uploaded.getbuffer())
 
         if uploaded.name.lower().endswith(".pdf"):
-            # primary extraction: PyPDFLoader
+            # try PyPDFLoader
             try:
                 loader = PyPDFLoader(str(target))
                 loaded = loader.load()
@@ -175,7 +169,7 @@ def ingest_files_to_chroma(
                     continue
             except Exception:
                 pass
-            # fallback: try pypdf
+            # fallback to pypdf
             try:
                 from pypdf import PdfReader
                 reader = PdfReader(str(target))
@@ -186,9 +180,9 @@ def ingest_files_to_chroma(
                     snippets.append({"name": uploaded.name, "preview": txt[:300]})
                     continue
             except Exception:
-                st.info(f"No text extracted from PDF {uploaded.name} (scanned?). Skipping.")
+                st.info(f"No text extracted from PDF {uploaded.name} (likely scanned). Skipping.")
         else:
-            # text file: try utf-8 then latin-1
+            # text file with encoding fallback
             for enc in ("utf-8", "latin-1"):
                 try:
                     loader = TextLoader(str(target), encoding=enc)
@@ -211,12 +205,12 @@ def ingest_files_to_chroma(
         return None
 
     if max_chunks and len(chunks) > max_chunks:
-        st.info(f"Indexing limited to first {max_chunks} chunks (from {len(chunks)}) to speed up deploy.")
+        st.info(f"Indexing limited to first {max_chunks} chunks (from {len(chunks)})")
         chunks = chunks[:max_chunks]
 
     texts = [getattr(d, "page_content", str(d)) for d in chunks]
 
-    # HF embeddings
+    # HF embeddings batched
     hf = HFInferenceEmbeddings(model=hf_embed_model)
     embeddings = []
     progress = st.progress(0)
@@ -232,18 +226,18 @@ def ingest_files_to_chroma(
         progress.progress(min(100, int(100 * (i + len(batch)) / n)))
     progress.empty()
 
-    # Create a simple wrapper to satisfy Chroma.from_documents expectation
+    # Simple wrapper to provide embedding methods to Chroma
     class SimpleEmbedFn:
-        def __init__(self, precomputed_vectors):
-            self._vectors = precomputed_vectors
+        def __init__(self, vectors, hf_instance):
+            self._vectors = vectors
+            self._hf = hf_instance
         def embed_documents(self, texts_in):
-            # Not used in our flow because we computed separately, but return precomputed to be safe
             return self._vectors
         def embed_query(self, text):
-            return hf.embed_query(text)
+            return self._hf.embed_query(text)
 
     try:
-        embed_fn = SimpleEmbedFn(embeddings)
+        embed_fn = SimpleEmbedFn(embeddings, hf)
         vectordb = Chroma.from_documents(chunks, embed_fn, persist_directory=str(chroma_dir))
         vectordb.persist()
     except Exception as e:
@@ -254,7 +248,58 @@ def ingest_files_to_chroma(
     return {"retriever": retriever, "chroma_path": str(chroma_dir), "chunks_indexed": len(chunks), "snippets": snippets}
 
 # -------------------------
-# UI Sidebar
+# Simple RAG-runner (no langchain.chains)
+# -------------------------
+def run_rag_query(retriever, llm, memory, user_question: str, qa_template: PromptTemplate, k: int = 3, max_chars: int = 1500):
+    # build memory text
+    try:
+        mem = memory.load_memory_variables({}).get("chat_history", [])
+    except Exception:
+        mem = []
+    if isinstance(mem, list) and mem:
+        mem_text = "\n".join(
+            f"{getattr(m, 'type', m.get('type', 'msg'))}: {getattr(m, 'content', m.get('content', str(m)))}"
+            for m in mem
+        )
+    else:
+        mem_text = ""
+
+    # retrieve docs (compat across retriever impls)
+    retrieved = []
+    try:
+        if hasattr(retriever, "get_relevant_documents"):
+            retrieved = retriever.get_relevant_documents(user_question)
+        elif hasattr(retriever, "similarity_search"):
+            retrieved = retriever.similarity_search(user_question, k=k)
+        else:
+            retrieved = retriever(user_question)
+    except Exception:
+        retrieved = []
+
+    doc_texts = []
+    for d in (retrieved or [])[:k]:
+        txt = getattr(d, "page_content", getattr(d, "content", str(d)))
+        if txt:
+            doc_texts.append(txt)
+    context = "\n\n---\n\n".join(doc_texts) if doc_texts else ""
+    if mem_text:
+        context = f"Conversation memory:\n{mem_text}\n\nRetrieved docs:\n{context}"
+
+    if len(context) > max_chars:
+        context = context[:max_chars] + "\n\n...[truncated]"
+
+    prompt_text = qa_template.format(context=context, question=user_question)
+
+    try:
+        out = llm.invoke(prompt_text)
+        answer = getattr(out, "content", str(out))
+    except Exception as e:
+        answer = f"LLM invocation error: {e}"
+
+    return answer, retrieved
+
+# -------------------------
+# Sidebar UI
 # -------------------------
 with st.sidebar:
     st.header("Settings")
@@ -268,7 +313,7 @@ with st.sidebar:
     chunk_size = st.number_input("Chunk size", value=DEFAULT_CHUNK_SIZE, min_value=512)
     chunk_overlap = st.number_input("Chunk overlap", value=DEFAULT_CHUNK_OVERLAP, min_value=0)
     max_chunks = st.number_input("Max chunks to index (0 = no limit)", value=DEFAULT_MAX_CHUNKS, min_value=0)
-    st.caption("HF API token must be available via HF_API_TOKEN env var or embedded fallback (this file).")
+    st.caption("HF API token: set HF_API_TOKEN env var or rely on embedded fallback (not recommended for public repos).")
 
     st.markdown("---")
     st.subheader("Uploads")
@@ -283,7 +328,7 @@ with st.sidebar:
         st.experimental_rerun()
 
 # -------------------------
-# App state init & LLM init
+# App init & LLM init
 # -------------------------
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -297,7 +342,7 @@ except Exception as e:
     st.stop()
 
 # -------------------------
-# Index button (on-demand)
+# Indexing button
 # -------------------------
 if uploaded_files:
     st.sidebar.markdown("### Uploaded files preview")
@@ -325,20 +370,19 @@ if uploaded_files:
                 st.error("Indexing failed; check HF token and try again.")
 
 # -------------------------
-# Use retriever
+# Use retriever if present
 # -------------------------
 use_rag = st.session_state.get("retriever_info") is not None
 memory = ConversationBufferWindowMemory(k=memory_window, return_messages=True, memory_key="chat_history")
-qa_prompt = PromptTemplate(input_variables=["context", "question"], template="Context:\n{context}\n\nQuestion:\n{question}\n\nAnswer concisely.")
+qa_template = PromptTemplate(input_variables=["context", "question"], template="Context:\n{context}\n\nQuestion:\n{question}\n\nAnswer concisely.")
 
 # -------------------------
 # Main UI (chat)
 # -------------------------
-st.title("Fast RAG — HF Inference embeddings (with token fallback)")
+st.title("Fast RAG — HF Inference (no langchain.chains)")
 
 col1, col2 = st.columns([3, 1])
 with col1:
-    # render chat
     for msg in st.session_state.messages:
         role = msg.get("role", "assistant")
         content = msg.get("content", "")
@@ -347,7 +391,7 @@ with col1:
         else:
             st.markdown(f'<div style="display:flex;justify-content:flex-start"><div style="background:#fff;padding:10px;border-radius:10px;max-width:80%">{content}</div></div>', unsafe_allow_html=True)
 
-    # image analysis
+    # Image analysis
     if image_file:
         st.image(image_file, use_column_width=True)
         q_img = st.text_input("Ask about this image:")
@@ -362,7 +406,7 @@ with col1:
             st.session_state.messages.append({"role": "assistant", "content": ans})
             st.experimental_rerun()
 
-    # chat form
+    # Chat form
     with st.form("chat_form", clear_on_submit=True):
         user_input = st.text_area("Type your message:", height=140)
         send = st.form_submit_button("Send")
@@ -373,25 +417,33 @@ with col1:
             try:
                 if use_rag:
                     retriever = st.session_state["retriever_info"]["retriever"]
-                    qa_chain = ConversationalRetrievalChain.from_llm(
-                        llm=llm,
+                    answer, retrieved_docs = run_rag_query(
                         retriever=retriever,
+                        llm=llm,
                         memory=memory,
-                        condense_question_prompt=PromptTemplate.from_template("Rephrase: {question}"),
-                        combine_docs_chain_kwargs={"prompt": qa_prompt},
-                        verbose=False,
+                        user_question=user_input,
+                        qa_template=qa_template,
+                        k=3
                     )
-                    res = qa_chain({"question": user_input})
-                    answer = res.get("answer") or "No answer."
                 else:
                     ctx = ""
-                    prompt_str = qa_prompt.format(context=ctx, question=user_input)
+                    prompt_str = qa_template.format(context=ctx, question=user_input)
                     out = llm.invoke(prompt_str)
                     answer = getattr(out, "content", str(out))
+                    retrieved_docs = []
             except Exception as e:
                 answer = f"Error generating answer: {e}"
+                retrieved_docs = []
 
         st.session_state.messages.append({"role": "assistant", "content": answer})
+
+        if retrieved_docs:
+            snippets = []
+            for d in retrieved_docs:
+                txt = getattr(d, "page_content", getattr(d, "content", str(d)))[:400]
+                snippets.append(txt)
+            st.session_state.messages.append({"role": "assistant", "content": "\n\nRetrieved snippets:\n\n" + "\n\n---\n\n".join(snippets)})
+
         st.experimental_rerun()
 
 with col2:
