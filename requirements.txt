@@ -1,0 +1,8 @@
+streamlit
+requests
+ollama
+langchain
+chromadb
+pypdf
+pdf2image
+pytesseract
