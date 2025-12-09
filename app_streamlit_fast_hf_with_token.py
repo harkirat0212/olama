@@ -84,31 +84,177 @@ def get_groq_key() -> str:
         pass
     return GROQ_KEY_FALLBACK
 
-class HFInferenceEmbeddings:
-    def __init__(self, model: str = DEFAULT_HF_EMBED_MODEL, timeout: int = HF_TIMEOUT):
-        token = get_hf_token()
-        if not token:
-            raise RuntimeError("HF API token not set (HF_API_TOKEN).")
-        self.url = f"https://api-inference.huggingface.co/embeddings/{model}"
-        self.headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        self.timeout = timeout
+# class HFInferenceEmbeddings:
+#     def __init__(self, model: str = DEFAULT_HF_EMBED_MODEL, timeout: int = HF_TIMEOUT):
+#         token = get_hf_token()
+#         if not token:
+#             raise RuntimeError("HF API token not set (HF_API_TOKEN).")
+#         self.url = f"https://api-inference.huggingface.co/embeddings/{model}"
+#         self.headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+#         self.timeout = timeout
 
-    def _post(self, inputs: List[str]):
-        payload = {"inputs": inputs}
-        r = requests.post(self.url, headers=self.headers, json=payload, timeout=self.timeout)
-        r.raise_for_status()
-        return r.json()
+#     def _post(self, inputs: List[str]):
+#         payload = {"inputs": inputs}
+#         r = requests.post(self.url, headers=self.headers, json=payload, timeout=self.timeout)
+#         r.raise_for_status()
+#         return r.json()
+
+#     def embed_documents(self, texts: List[str]) -> List[List[float]]:
+#         out = []
+#         for i in range(0, len(texts), HF_BATCH_SIZE):
+#             batch = texts[i : i + HF_BATCH_SIZE]
+#             out_batch = self._post(batch)
+#             out.extend(out_batch)
+#         return out
+
+#     def embed_query(self, text: str) -> List[float]:
+#         return self._post([text])[0]
+
+from typing import Iterable
+
+class HFInferenceEmbeddings:
+    """
+    Robust HF embeddings helper:
+     - Attempts multiple inference endpoints (embeddings, pipeline/feature-extraction)
+     - Falls back to huggingface_hub.InferenceClient if installed
+     - Batches requests and returns a list of vectors
+    """
+    def __init__(self, model: str = DEFAULT_HF_EMBED_MODEL, timeout: int = HF_TIMEOUT):
+        self.model = model
+        self.timeout = timeout
+        self.token = get_hf_token()
+        if not self.token:
+            raise RuntimeError("HF API token not set (HF_API_TOKEN).")
+
+        # Candidate endpoints to try (ordered)
+        self.endpoints = [
+            f"https://api-inference.huggingface.co/embeddings/{model}",
+            f"https://api-inference.huggingface.co/pipeline/feature-extraction/{model}",
+            f"https://api-inference.huggingface.co/models/{model}/pipeline/feature-extraction",
+            f"https://api-inference.huggingface.co/models/{model}",  # last resort (may not return embeddings)
+        ]
+        self.headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+        # Try to instantiate huggingface_hub InferenceClient if available (best fallback)
+        self.hf_client = None
+        try:
+            from huggingface_hub import InferenceClient
+            self.hf_client = InferenceClient(self.token)
+        except Exception:
+            self.hf_client = None
+
+    def _try_request(self, url: str, inputs: Iterable[str]):
+        """POST to HF inference endpoint and return JSON or raise."""
+        payload = {"inputs": list(inputs)}
+        resp = requests.post(url, headers=self.headers, json=payload, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _normalize_response(self, resp):
+        """
+        Normalize response to list-of-vectors shape.
+        Many HF endpoints return:
+         - list[list[float]]  (good)
+         - {"error": "..."}   (bad)
+         - list[{"embedding": [...]}] (rare)
+        """
+        if resp is None:
+            return None
+        # If already list of lists of floats
+        if isinstance(resp, list) and resp and all(isinstance(x, list) for x in resp):
+            return resp
+        # If list of dicts with 'embedding' or 'vector' keys
+        if isinstance(resp, list) and resp and all(isinstance(x, dict) for x in resp):
+            out = []
+            for item in resp:
+                if "embedding" in item:
+                    out.append(item["embedding"])
+                elif "vector" in item:
+                    out.append(item["vector"])
+                elif "generated_text" in item and isinstance(item["generated_text"], list):
+                    out.append(item["generated_text"])
+                else:
+                    # can't normalize this item
+                    return None
+            return out
+        # If single dict with embeddings keyed, try to extract
+        if isinstance(resp, dict):
+            # Some pipeline outputs might be nested
+            if "error" in resp:
+                raise RuntimeError(f"Hugging Face error: {resp.get('error')}")
+            # attempt to find embeddings key
+            for k in ("embedding", "embeddings", "vector", "vectors"):
+                if k in resp:
+                    v = resp[k]
+                    if isinstance(v, list) and all(isinstance(x, list) for x in v):
+                        return v
+            # otherwise can't normalize
+            return None
+        return None
+
+    def _call_hf_client(self, inputs: Iterable[str]):
+        """Use huggingface_hub.InferenceClient if available (preferred)."""
+        if not self.hf_client:
+            return None
+        try:
+            out = self.hf_client.embeddings(model=self.model, inputs=list(inputs))
+            # InferenceClient.embeddings returns list-of-vectors for list input
+            return out
+        except Exception as e:
+            # try InferenceClient.__call__ fallback (pipeline)
+            try:
+                resp = self.hf_client(inputs=list(inputs), model=self.model)
+                norm = self._normalize_response(resp)
+                return norm
+            except Exception:
+                return None
+
+    def _request_try_endpoints(self, inputs: Iterable[str]):
+        # First try huggingface_hub client if available
+        if self.hf_client:
+            try:
+                out = self._call_hf_client(inputs)
+                if out:
+                    return out
+            except Exception:
+                pass
+
+        # Then try HTTP endpoints in order
+        for url in self.endpoints:
+            try:
+                resp = self._try_request(url, inputs)
+                norm = self._normalize_response(resp)
+                if norm:
+                    return norm
+                # if normalization failed but endpoint returned something, still continue to next endpoint
+            except requests.HTTPError as he:
+                status = getattr(he.response, "status_code", None)
+                # try next endpoint for 410/404 etc.
+                if status in (410, 404, 403):
+                    continue
+                # re-raise other HTTP errors so they become visible
+                raise
+            except Exception:
+                # try next endpoint
+                continue
+        # all endpoints failed
+        raise RuntimeError("All HF inference endpoints failed or returned unexpected formats for embeddings.")
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        # Batch
         out = []
         for i in range(0, len(texts), HF_BATCH_SIZE):
             batch = texts[i : i + HF_BATCH_SIZE]
-            out_batch = self._post(batch)
-            out.extend(out_batch)
+            res = self._request_try_endpoints(batch)
+            if res is None:
+                raise RuntimeError("Failed to get embeddings for batch.")
+            out.extend(res)
         return out
 
     def embed_query(self, text: str) -> List[float]:
-        return self._post([text])[0]
+        res = self._request_try_endpoints([text])
+        if not res or not isinstance(res, list):
+            raise RuntimeError("Failed to compute query embedding.")
+        return res[0]
 
 class HFImageCaption:
     def __init__(self, model: str = DEFAULT_HF_IMAGE_MODEL, timeout: int = HF_TIMEOUT):
