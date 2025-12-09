@@ -1,84 +1,157 @@
-# app_streamlit_chroma_hf_ollama.py
+# app_streamlit_groq_chroma_hf.py
 """
-Streamlit app: RAG with Chromadb + HuggingFace Inference embeddings + Ollama LLM (no LangChain).
-- Extracts text from PDFs using pypdf
-- Chunks text with sliding window
-- Embeds via HF Inference API
-- Stores embeddings + docs in chromadb collection (persisted)
-- Queries chromadb with HF query embedding
-- Calls Ollama for generation / image analysis
-WARNING: keep HF token private; remove fallback before publishing.
+Deployable Streamlit RAG chatbot:
+- Groq (Llama-3) for text generation (via Groq OpenAI-compatible endpoint)
+- Hugging Face Inference API for embeddings & image captioning
+- Chroma (duckdb+parquet) for vector store (persist per upload fingerprint)
+- No langchain/ollama dependencies
+Note: API keys are embedded as fallbacks but can be overridden with env vars.
 """
 
 import os
 import hashlib
 import tempfile
-import time
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional
 
 import requests
 import streamlit as st
 import chromadb
 from chromadb.config import Settings
-from chromadb.utils import embedding_functions
 from pypdf import PdfReader
 
-import ollama
+# -------------------------
+# === USER-SUPPLIED KEYS (FALLBACKS) ===
+# You gave these keys — they're used as defaults if env vars are not set.
+# Remove these from code before making repo public if you care about security.
+GROQ_KEY_FALLBACK = "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"
+HF_KEY_FALLBACK = "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"
+# -------------------------
 
 # -------------------------
-# CONFIG & CONSTANTS
+# Configuration / Defaults
 # -------------------------
-HF_TOKEN_FALLBACK = "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"  # remove before publishing
 DEFAULT_HF_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_HF_IMAGE_MODEL = "Salesforce/blip-image-captioning-large"
+DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 
 TMP_DIR = Path(os.environ.get("STREAMLIT_CHROMA_DIR", tempfile.gettempdir())) / "chroma_persist"
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_UPLOADS = 6
 MAX_UPLOAD_MB = 200
-DEFAULT_CHUNK_SIZE = 1000
-DEFAULT_CHUNK_OVERLAP = 200
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 200
 HF_BATCH_SIZE = 16
-HF_TIMEOUT = 60
+HF_TIMEOUT = 60  # seconds
 
-st.set_page_config(page_title="RAG — Chroma + HF + Ollama", layout="wide")
+st.set_page_config(page_title="RAG — Groq + HF + Chroma", layout="wide")
 
 # -------------------------
-# Utilities
+# Helpers: Secrets, HF embeddings, image captioning
 # -------------------------
 def get_hf_token() -> str:
+    # priority: env var -> Streamlit secrets -> fallback constant
     token = os.environ.get("HF_API_TOKEN")
     if token and token.strip():
         return token.strip()
-    return HF_TOKEN_FALLBACK
+    # streamlit secrets (if deployed on Streamlit Cloud)
+    try:
+        token = st.secrets.get("HF_API_TOKEN")
+        if token and token.strip():
+            return token.strip()
+    except Exception:
+        pass
+    return HF_KEY_FALLBACK
+
+def get_groq_key() -> str:
+    key = os.environ.get("GROQ_API_KEY")
+    if key and key.strip():
+        return key.strip()
+    try:
+        key = st.secrets.get("GROQ_API_KEY")
+        if key and key.strip():
+            return key.strip()
+    except Exception:
+        pass
+    return GROQ_KEY_FALLBACK
 
 class HFInferenceEmbeddings:
-    """Simple HF Inference embeddings wrapper (embeddings endpoint)."""
-    def __init__(self, model: str = DEFAULT_HF_EMBED_MODEL):
+    def __init__(self, model: str = DEFAULT_HF_EMBED_MODEL, timeout: int = HF_TIMEOUT):
         token = get_hf_token()
         if not token:
-            raise RuntimeError("HF API token missing (set HF_API_TOKEN env var).")
+            raise RuntimeError("HF_API_TOKEN not set.")
         self.url = f"https://api-inference.huggingface.co/embeddings/{model}"
         self.headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        self.timeout = timeout
 
     def _post(self, inputs: List[str]) -> List[List[float]]:
         payload = {"inputs": inputs}
-        resp = requests.post(self.url, headers=self.headers, json=payload, timeout=HF_TIMEOUT)
-        resp.raise_for_status()
-        return resp.json()
+        r = requests.post(self.url, headers=self.headers, json=payload, timeout=self.timeout)
+        r.raise_for_status()
+        return r.json()
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         out = []
         for i in range(0, len(texts), HF_BATCH_SIZE):
             batch = texts[i : i + HF_BATCH_SIZE]
-            vectors = self._post(batch)
-            out.extend(vectors)
+            out_batch = self._post(batch)
+            out.extend(out_batch)
         return out
 
     def embed_query(self, text: str) -> List[float]:
         return self._post([text])[0]
 
+class HFImageCaption:
+    def __init__(self, model: str = DEFAULT_HF_IMAGE_MODEL, timeout: int = HF_TIMEOUT):
+        token = get_hf_token()
+        if not token:
+            raise RuntimeError("HF_API_TOKEN not set.")
+        self.url = f"https://api-inference.huggingface.co/models/{model}"
+        self.headers = {"Authorization": f"Bearer {token}"}
+        self.timeout = timeout
+
+    def caption(self, image_bytes: bytes) -> str:
+        files = {"image": ("image.jpg", image_bytes, "image/jpeg")}
+        r = requests.post(self.url, headers=self.headers, files=files, timeout=self.timeout)
+        r.raise_for_status()
+        out = r.json()
+        if isinstance(out, list) and out and isinstance(out[0], dict) and "generated_text" in out[0]:
+            return out[0]["generated_text"]
+        if isinstance(out, dict) and "generated_text" in out:
+            return out["generated_text"]
+        return str(out)
+
+# -------------------------
+# Groq client (OpenAI-compatible)
+# -------------------------
+class GroqClient:
+    ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
+    def __init__(self, api_key: Optional[str] = None, timeout: int = 60):
+        self.api_key = (api_key or get_groq_key())
+        if not self.api_key:
+            raise RuntimeError("GROQ_API_KEY not set.")
+        self.headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        self.timeout = timeout
+
+    def chat(self, messages: List[Dict[str, str]], model: str = DEFAULT_GROQ_MODEL, max_tokens: int = 512, temperature: float = 0.0) -> str:
+        body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
+        r = requests.post(self.ENDPOINT, headers=self.headers, json=body, timeout=self.timeout)
+        r.raise_for_status()
+        res = r.json()
+        try:
+            choice = res.get("choices", [None])[0]
+            if not choice:
+                return str(res)
+            if "message" in choice and isinstance(choice["message"], dict):
+                return choice["message"].get("content", "") or str(choice)
+            return choice.get("text", "") or str(choice)
+        except Exception:
+            return str(res)
+
+# -------------------------
+# File fingerprinting & chunking
+# -------------------------
 def fingerprint_files(files: List[st.runtime.uploaded_file_manager.UploadedFile]) -> str:
     h = hashlib.sha256()
     for f in sorted(files, key=lambda x: x.name):
@@ -92,93 +165,70 @@ def fingerprint_files(files: List[st.runtime.uploaded_file_manager.UploadedFile]
         h.update(str(size).encode("utf-8"))
     return h.hexdigest()[:16]
 
-def chunk_text(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE, overlap: int = DEFAULT_CHUNK_OVERLAP) -> List[str]:
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
     if not text:
         return []
-    if chunk_size <= 0:
-        return [text]
     chunks = []
     start = 0
-    text_len = len(text)
-    while start < text_len:
-        end = start + chunk_size
-        chunk = text[start:end]
-        chunks.append(chunk)
-        if end >= text_len:
+    L = len(text)
+    while start < L:
+        end = min(start + chunk_size, L)
+        chunks.append(text[start:end])
+        if end >= L:
             break
         start = end - overlap
     return chunks
 
 # -------------------------
-# Chromadb helpers (direct client)
+# Chroma helpers
 # -------------------------
-def chroma_client(persist_directory: str):
-    # Use local disk persistence
+def chroma_client(persist_directory: str) -> chromadb.Client:
     return chromadb.Client(Settings(persist_directory=persist_directory, chroma_db_impl="duckdb+parquet"))
 
-def ensure_collection_for_fp(client: chromadb.Client, fp: str):
-    col_name = f"col_{fp}"
+def ensure_collection(client: chromadb.Client, name: str):
     try:
-        return client.get_collection(name=col_name)
+        return client.get_collection(name=name)
     except Exception:
-        # create new collection
-        return client.create_collection(name=col_name)
+        return client.create_collection(name=name)
 
-def index_documents_to_chroma(
-    uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile],
-    hf_embed_model: str,
-    chunk_size: int,
-    chunk_overlap: int,
-    max_chunks: int,
-) -> Dict[str, Any]:
+def index_uploaded_files(uploaded_files, hf_embed_model: str, chunk_size: int, chunk_overlap: int, max_chunks: Optional[int]):
     if not uploaded_files:
         return None
-
     fp = fingerprint_files(uploaded_files)
     persist_dir = str(TMP_DIR / fp)
     Path(persist_dir).mkdir(parents=True, exist_ok=True)
+    client = chroma_client(persist_dir)
+    col = ensure_collection(client, f"col_{fp}")
 
-    client = chroma_client(persist_directory=persist_dir)
-    collection = ensure_collection_for_fp(client, fp)
-
-    # Check if collection already has data -> reuse
+    # reuse if already present
     try:
-        existing_count = collection.count()
-        if existing_count and existing_count > 0:
-            return {"collection": collection, "persist_dir": persist_dir, "indexed_chunks": existing_count}
+        cnt = col.count()
+        if cnt and cnt > 0:
+            return {"collection": col, "persist_dir": persist_dir, "indexed_chunks": cnt, "snippets": []}
     except Exception:
-        existing_count = None
+        pass
 
-    texts = []
-    metadatas = []
-    ids = []
-    doc_refs = []  # human readable doc references for previews
-
+    texts, ids, metadatas, snippets = [], [], [], []
     for uploaded in uploaded_files[:MAX_UPLOADS]:
-        # size guard
         try:
             size = getattr(uploaded, "size", None) or len(uploaded.getbuffer())
         except Exception:
             size = 0
         if size > MAX_UPLOAD_MB * 1024 * 1024:
-            st.warning(f"Skipping {uploaded.name} (> {MAX_UPLOAD_MB} MB)")
+            st.warning(f"Skipping {uploaded.name} (> {MAX_UPLOAD_MB}MB)")
             continue
 
-        # save file to raw directory
         raw_dir = Path(persist_dir) / "raw"
         raw_dir.mkdir(parents=True, exist_ok=True)
         target = raw_dir / uploaded.name
         with open(target, "wb") as f:
             f.write(uploaded.getbuffer())
 
-        # extract text
         text = ""
         if uploaded.name.lower().endswith(".pdf"):
             try:
                 reader = PdfReader(str(target))
-                pages = []
-                for p in reader.pages:
-                    pages.append(p.extract_text() or "")
+                pages = [p.extract_text() or "" for p in reader.pages]
                 text = "\n\n".join(pages)
             except Exception as e:
                 st.info(f"Could not read PDF {uploaded.name}: {e}")
@@ -193,67 +243,61 @@ def index_documents_to_chroma(
                     text = ""
 
         if not text or not text.strip():
-            st.info(f"No text extracted from {uploaded.name}; skipping.")
+            st.info(f"No text extracted from {uploaded.name}, skipping.")
             continue
 
-        # chunk
         chunks = chunk_text(text, chunk_size=chunk_size, overlap=chunk_overlap)
         for i, c in enumerate(chunks):
             uid = f"{uploaded.name}__{i}"
             ids.append(uid)
             texts.append(c)
-            metadatas.append({"source": uploaded.name, "chunk_index": i})
-            doc_refs.append({"name": uploaded.name, "preview": c[:300]})
+            metadatas.append({"source": uploaded.name, "chunk": i})
+            snippets.append({"name": uploaded.name, "preview": c[:300]})
 
     if not texts:
-        st.warning("No text found to index.")
+        st.warning("No text to index.")
         return None
 
-    # cap chunks
     if max_chunks and len(texts) > max_chunks:
-        st.info(f"Indexing first {max_chunks} chunks out of {len(texts)} for speed.")
-        ids = ids[:max_chunks]
-        texts = texts[:max_chunks]
-        metadatas = metadatas[:max_chunks]
+        st.info(f"Indexing first {max_chunks} chunks (out of {len(texts)})")
+        texts = texts[:max_chunks]; ids = ids[:max_chunks]; metadatas = metadatas[:max_chunks]
 
-    # embeddings (HF Inference)
+    # embeddings via HF
     hf = HFInferenceEmbeddings(model=hf_embed_model)
     embeddings = []
     progress = st.progress(0)
-    n = len(texts)
-    for i in range(0, n, HF_BATCH_SIZE):
+    total = len(texts)
+    for i in range(0, total, HF_BATCH_SIZE):
         batch = texts[i : i + HF_BATCH_SIZE]
         try:
-            out = hf.embed_documents(batch)
+            ev = hf.embed_documents(batch)
         except Exception as e:
-            st.error(f"HF embeddings error: {e}")
+            st.error(f"HF embedding error: {e}")
             return None
-        embeddings.extend(out)
-        progress.progress(min(100, int(100 * (i + len(batch)) / n)))
+        embeddings.extend(ev)
+        progress.progress(min(100, int(100 * (i + len(batch)) / total)))
     progress.empty()
 
-    # add to chroma collection
     try:
-        collection.add(
-            documents=texts,
-            metadatas=metadatas,
-            ids=ids,
-            embeddings=embeddings,
-        )
+        col.add(documents=texts, metadatas=metadatas, ids=ids, embeddings=embeddings)
         client.persist()
     except Exception as e:
-        st.error(f"Failed to add to Chroma: {e}")
+        st.error(f"Failed to save to Chroma: {e}")
         return None
 
-    return {"collection": collection, "persist_dir": persist_dir, "indexed_chunks": len(texts), "snippets": doc_refs}
+    return {"collection": col, "persist_dir": persist_dir, "indexed_chunks": len(texts), "snippets": snippets}
 
-def query_chroma(collection: chromadb.api.models.Collection, query: str, hf_model_for_query: str, k: int = 3) -> List[Dict[str, Any]]:
+def query_collection(collection: chromadb.api.models.Collection, query: str, hf_embed_model: str, k: int = 3):
     if collection is None:
         return []
-    hf = HFInferenceEmbeddings(model=hf_model_for_query)
-    q_emb = hf.embed_query(query)
+    hf = HFInferenceEmbeddings(model=hf_embed_model)
     try:
-        res = collection.query(query_embeddings=[q_emb], n_results=k, include=["documents", "metadatas", "distances"])
+        qv = hf.embed_query(query)
+    except Exception as e:
+        st.error(f"HF embedding error for query: {e}")
+        return []
+    try:
+        res = collection.query(query_embeddings=[qv], n_results=k, include=["documents", "metadatas", "distances"])
     except Exception as e:
         st.error(f"Chroma query error: {e}")
         return []
@@ -266,41 +310,36 @@ def query_chroma(collection: chromadb.api.models.Collection, query: str, hf_mode
     return docs
 
 # -------------------------
-# Simple memory (windowed) using session_state
+# Memory helper
 # -------------------------
 class SimpleMemory:
     def __init__(self, k: int = 4):
         self.k = max(1, int(k))
-
-    def load_memory_variables(self, _) -> Dict[str, List[Dict[str, str]]]:
+    def load_memory(self):
         msgs = st.session_state.get("messages", [])
         last = msgs[-self.k:] if msgs else []
-        return {"chat_history": [{"type": m.get("role", "assistant"), "content": m.get("content", "")} for m in last]}
+        return [{"type": m.get("role", "assistant"), "content": m.get("content","")} for m in last]
 
 # -------------------------
-# UI / App
+# Sidebar & UI
 # -------------------------
 with st.sidebar:
     st.header("Settings")
-    text_model = st.selectbox("Text model (ollama)", ["llama3", "mistral"], index=0)
-    vision_model = st.selectbox("Vision model (ollama)", ["moondream"], index=0)
+    groq_model = st.text_input("Groq model", value=DEFAULT_GROQ_MODEL)
+    hf_embed_model = st.text_input("HF embed model", value=DEFAULT_HF_EMBED_MODEL)
+    hf_image_model = st.text_input("HF image caption model", value=DEFAULT_HF_IMAGE_MODEL)
+    chunk_size = st.number_input("Chunk size", value=CHUNK_SIZE, min_value=256)
+    chunk_overlap = st.number_input("Chunk overlap", value=CHUNK_OVERLAP, min_value=0)
+    max_chunks = st.number_input("Max chunks to index (0=no limit)", value=0, min_value=0)
     memory_window = st.slider("Memory window", 1, 10, 4)
     st.markdown("---")
-    st.subheader("RAG / Indexing")
-    hf_embed_model = st.text_input("HF embed model", value=DEFAULT_HF_EMBED_MODEL)
-    chunk_size = st.number_input("Chunk size", value=DEFAULT_CHUNK_SIZE, min_value=256)
-    chunk_overlap = st.number_input("Chunk overlap", value=DEFAULT_CHUNK_OVERLAP, min_value=0)
-    max_chunks = st.number_input("Max chunks to index (0=no limit)", value=0, min_value=0)
+    uploaded_files = st.file_uploader("Upload PDF/TXT (multiple)", type=["pdf","txt"], accept_multiple_files=True)
+    image_file = st.file_uploader("Upload image (optional)", type=["png","jpg","jpeg"])
     st.markdown("---")
-    st.subheader("Uploads")
-    uploaded_files = st.file_uploader("Upload PDF / TXT (multiple)", type=["pdf", "txt"], accept_multiple_files=True)
-    image_file = st.file_uploader("Upload image (optional)", type=["png", "jpg", "jpeg"])
-    st.markdown("---")
-    if st.button("Clear conversation & retriever"):
-        for k in ["messages", "chroma_info"]:
-            if k in st.session_state:
-                del st.session_state[k]
-        st.rerun()
+    if st.button("Clear conversation & index"):
+        for k in ["messages","chroma_info"]:
+            if k in st.session_state: del st.session_state[k]
+        st.experimental_rerun()
 
 # session init
 if "messages" not in st.session_state:
@@ -308,27 +347,21 @@ if "messages" not in st.session_state:
 if "chroma_info" not in st.session_state:
     st.session_state["chroma_info"] = None
 
-# init LLMs (Ollama)
-@st.cache_resource
-def get_ollama_models(text_model_name: str, vision_model_name: str):
-    text_llm = ollama.Chat(model=text_model_name) if hasattr(ollama, "Chat") else ollama  # compatibility
-    vision_llm = ollama.Chat(model=vision_model_name) if hasattr(ollama, "Chat") else ollama
-    return text_llm, vision_llm
-
+# instantiate Groq client (non-blocking)
+groq_client = None
 try:
-    llm, vision_llm = get_ollama_models(text_model, vision_model)
+    groq_client = GroqClient()
 except Exception as e:
-    st.error(f"Ollama client init error: {e}")
-    st.stop()
+    st.sidebar.warning(f"Groq init warning: {e}")
 
-st.title("RAG — Chroma + HF Inference + Ollama")
+st.title("RAG Chat — Groq Llama-3 + HF embeddings + Chroma")
 
-col1, col2 = st.columns([3, 1])
+col1, col2 = st.columns([3,1])
 with col1:
     # render chat
     for msg in st.session_state["messages"]:
-        role = msg.get("role", "assistant")
-        content = msg.get("content", "")
+        role = msg.get("role","assistant")
+        content = msg.get("content","")
         if role == "user":
             st.markdown(f'<div style="display:flex;justify-content:flex-end"><div style="background:#DCF8C6;padding:10px;border-radius:10px;max-width:80%">{content}</div></div>', unsafe_allow_html=True)
         else:
@@ -337,95 +370,134 @@ with col1:
     # image analysis
     if image_file:
         st.image(image_file, use_column_width=True)
-        q_img = st.text_input("Ask something about this image:")
+        q_img = st.text_input("Ask something about this image (optional):")
         if q_img and st.button("Analyze image"):
             img_bytes = image_file.getvalue()
-            with st.spinner("Analyzing image..."):
+            with st.spinner("Captioning image (HF)..."):
                 try:
-                    resp = ollama.generate(model=vision_model, prompt=q_img, images=[img_bytes])
-                    answer = resp.get("response") if isinstance(resp, dict) else str(resp)
+                    hf_img = HFImageCaption(model=hf_image_model)
+                    caption = hf_img.caption(img_bytes)
                 except Exception as e:
-                    answer = f"Vision model error: {e}"
-            st.session_state["messages"].append({"role": "assistant", "content": answer})
-            st.rerun()
+                    caption = f"[Image captioning error] {e}"
+            prompt = f"Image caption: {caption}\n\nQuestion: {q_img}\nAnswer concisely."
+            answer = None
+            if groq_client:
+                try:
+                    messages = [{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":prompt}]
+                    answer = groq_client.chat(messages=messages, model=groq_model, max_tokens=512, temperature=0.0)
+                except Exception as e:
+                    answer = f"[Groq error] {e}"
+            else:
+                # fallback to HF text generation (flan-t5)
+                try:
+                    hf_text_url = f"https://api-inference.huggingface.co/models/google/flan-t5-large"
+                    hf_headers = {"Authorization": f"Bearer {get_hf_token()}"}
+                    resp = requests.post(hf_text_url, headers=hf_headers, json={"inputs": prompt, "options":{"wait_for_model": True}}, timeout=HF_TIMEOUT)
+                    resp.raise_for_status()
+                    out = resp.json()
+                    if isinstance(out, list) and out and isinstance(out[0], dict) and "generated_text" in out[0]:
+                        answer = out[0]["generated_text"]
+                    else:
+                        answer = str(out)
+                except Exception as e:
+                    answer = f"[HF fallback error] {e}"
+            st.session_state["messages"].append({"role":"assistant","content":answer})
+            st.experimental_rerun()
 
-    # text chat form
+    # chat form
     with st.form("chat_form", clear_on_submit=True):
         user_input = st.text_area("Type your message:", height=140)
-        submitted = st.form_submit_button("Send")
+        send = st.form_submit_button("Send")
 
-    if submitted and user_input and user_input.strip():
-        st.session_state["messages"].append({"role": "user", "content": user_input})
+    if send and user_input and user_input.strip():
+        st.session_state["messages"].append({"role":"user","content":user_input})
         with st.spinner("Thinking..."):
             try:
-                chroma_info = st.session_state.get("chroma_info")
                 memory = SimpleMemory(k=memory_window)
+                chroma_info = st.session_state.get("chroma_info")
                 if chroma_info and chroma_info.get("collection"):
-                    # RAG flow: query chroma
                     collection = chroma_info["collection"]
-                    docs = query_chroma(collection, user_input, hf_embed_model, k=3)
-                    # build context from docs
-                    context_pieces = []
-                    for d in docs:
-                        context_pieces.append(d.get("document", "")[:1000])
-                    context = "\n\n---\n\n".join(context_pieces)
-                    # include memory
-                    mem = memory.load_memory_variables({}).get("chat_history", [])
-                    mem_text = "\n".join(f'{m.get("type")}: {m.get("content")}' for m in mem) if mem else ""
-                    prompt = f"Conversation memory:\n{mem_text}\n\nRetrieved docs:\n{context}\n\nQuestion:\n{user_input}\n\nAnswer concisely."
-                    # call ollama
-                    try:
-                        resp = ollama.generate(model=text_model, prompt=prompt)
-                        answer = resp.get("response") if isinstance(resp, dict) else str(resp)
-                    except Exception as e:
-                        answer = f"LLM (Ollama) error: {e}"
+                    docs = query_collection(collection, user_input, hf_embed_model=hf_embed_model, k=3)
+                    retrieved_texts = [d.get("document","")[:1000] for d in docs]
+                    context = "\n\n---\n\n".join(retrieved_texts)
+                    mem_items = memory.load_memory()
+                    mem_text = "\n".join(f"{m.get('type')}: {m.get('content')}" for m in mem_items) if mem_items else ""
+                    system_prompt = "You are a helpful assistant. Use retrieved documents to answer concisely and accurately. If citing, mention the source filename."
+                    user_prompt = f"Conversation memory:\n{mem_text}\n\nRetrieved docs:\n{context}\n\nQuestion:\n{user_input}\n\nAnswer concisely."
+                    final_answer = ""
+                    if groq_client:
+                        messages = [{"role":"system","content":system_prompt},{"role":"user","content":user_prompt}]
+                        try:
+                            final_answer = groq_client.chat(messages=messages, model=groq_model, max_tokens=512, temperature=0.0)
+                        except Exception as e:
+                            final_answer = f"[Groq error] {e}"
+                    else:
+                        try:
+                            hf_text_url = f"https://api-inference.huggingface.co/models/google/flan-t5-large"
+                            hf_headers = {"Authorization": f"Bearer {get_hf_token()}"}
+                            resp = requests.post(hf_text_url, headers=hf_headers, json={"inputs": user_prompt, "options":{"wait_for_model": True}}, timeout=HF_TIMEOUT)
+                            resp.raise_for_status()
+                            out = resp.json()
+                            if isinstance(out, list) and out and isinstance(out[0], dict) and "generated_text" in out[0]:
+                                final_answer = out[0]["generated_text"]
+                            else:
+                                final_answer = str(out)
+                        except Exception as e:
+                            final_answer = f"[HF fallback error] {e}"
                 else:
-                    # non-RAG: direct LLM call
                     prompt = f"Question:\n{user_input}\n\nAnswer concisely."
-                    try:
-                        resp = ollama.generate(model=text_model, prompt=prompt)
-                        answer = resp.get("response") if isinstance(resp, dict) else str(resp)
-                    except Exception as e:
-                        answer = f"LLM (Ollama) error: {e}"
+                    if groq_client:
+                        messages = [{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":prompt}]
+                        try:
+                            final_answer = groq_client.chat(messages=messages, model=groq_model, max_tokens=512, temperature=0.0)
+                        except Exception as e:
+                            final_answer = f"[Groq error] {e}"
+                    else:
+                        try:
+                            hf_text_url = f"https://api-inference.huggingface.co/models/google/flan-t5-large"
+                            hf_headers = {"Authorization": f"Bearer {get_hf_token()}"}
+                            resp = requests.post(hf_text_url, headers=hf_headers, json={"inputs": prompt, "options":{"wait_for_model": True}}, timeout=HF_TIMEOUT)
+                            resp.raise_for_status()
+                            out = resp.json()
+                            if isinstance(out, list) and out and isinstance(out[0], dict) and "generated_text" in out[0]:
+                                final_answer = out[0]["generated_text"]
+                            else:
+                                final_answer = str(out)
+                        except Exception as e:
+                            final_answer = f"[HF fallback error] {e}"
             except Exception as e:
-                answer = f"Unhandled error: {e}"
+                final_answer = f"[Unhandled error] {e}"
 
-        st.session_state["messages"].append({"role": "assistant", "content": answer})
-        st.rerun()
+        st.session_state["messages"].append({"role":"assistant","content": final_answer})
+        st.experimental_rerun()
 
 with col2:
-    st.markdown("### RAG / Indexing")
+    st.markdown("### RAG & Status")
     chroma_info = st.session_state.get("chroma_info")
     if chroma_info:
-        st.success("Chroma index loaded.")
+        st.success("Chroma index loaded")
         st.write({"persist_dir": chroma_info.get("persist_dir"), "indexed_chunks": chroma_info.get("indexed_chunks")})
         if chroma_info.get("snippets"):
             st.markdown("**Document previews:**")
-            for s in chroma_info["snippets"][:5]:
+            for s in chroma_info["snippets"][:6]:
                 st.markdown(f"- **{s['name']}** — `{s['preview'][:160]}...`")
     else:
-        st.info("No Chroma index loaded. Upload files and click 'Index uploaded files' in the sidebar.")
+        st.info("No Chroma index. Upload files and click 'Index uploaded files' below.")
 
     st.markdown("---")
-    if uploaded_files and st.button("Index uploaded files (HF inference)"):
-        with st.spinner("Indexing (HF embeddings -> Chroma)..."):
-            info = index_documents_to_chroma(
-                uploaded_files=uploaded_files,
-                hf_embed_model=hf_embed_model,
-                chunk_size=int(chunk_size),
-                chunk_overlap=int(chunk_overlap),
-                max_chunks=(None if int(max_chunks) == 0 else int(max_chunks)),
-            )
+    if uploaded_files and st.button("Index uploaded files (HF embeddings -> Chroma)"):
+        with st.spinner("Indexing..."):
+            info = index_uploaded_files(uploaded_files=uploaded_files, hf_embed_model=hf_embed_model, chunk_size=int(chunk_size), chunk_overlap=int(chunk_overlap), max_chunks=(None if int(max_chunks)==0 else int(max_chunks)))
             if info:
                 st.session_state["chroma_info"] = info
                 st.success(f"Indexed {info.get('indexed_chunks')} chunks.")
             else:
-                st.error("Indexing failed. See messages above.")
+                st.error("Indexing failed.")
 
     st.markdown("---")
     if st.button("Show memory"):
-        memory = SimpleMemory(k=memory_window)
-        st.write(memory.load_memory_variables({}).get("chat_history", []))
+        mem = SimpleMemory(k=memory_window).load_memory()
+        st.write(mem)
 
     st.markdown("---")
-    st.caption("Set HF_API_TOKEN in environment to override embedded token. Keep token private; remove fallback before publishing.")
+    st.caption("Set HF_API_TOKEN and GROQ_API_KEY in Streamlit Secrets (recommended). Hardcoded fallbacks are present for quick testing; remove them before publishing.")
