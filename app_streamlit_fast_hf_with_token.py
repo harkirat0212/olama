@@ -19,7 +19,8 @@ import streamlit as st
 # Ollama & LangChain imports
 import ollama
 from langchain_ollama import ChatOllama
-from langchain.prompts import PromptTemplate
+#from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferWindowMemory
 from langchain.document_loaders import PyPDFLoader, TextLoader
