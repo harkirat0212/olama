@@ -493,8 +493,8 @@ def query_chroma_collection(collection, query_text: str, candidate_embed_models:
 # -------------------------
 with st.sidebar:
     st.header("Settings")
-    st.markdown("HF token: set `HF_API_TOKEN` in Streamlit Secrets or env (recommended).")
-    st.markdown("GROQ key: set `GROQ_API_KEY` in Secrets/env to use Groq (optional).")
+    # st.markdown("HF token: set `HF_API_TOKEN` in Streamlit Secrets or env (recommended).")
+    # st.markdown("GROQ key: set `GROQ_API_KEY` in Secrets/env to use Groq (optional).")
     uploaded_files = st.file_uploader("Upload PDF / TXT (multiple)", type=["pdf","txt"], accept_multiple_files=True)
     image_file = st.file_uploader("Upload image (optional)", type=["png","jpg","jpeg"])
     st.markdown("---")
