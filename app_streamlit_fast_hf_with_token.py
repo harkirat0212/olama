@@ -783,7 +783,7 @@ HF_TEXT_MODEL_FALLBACK = "google/flan-t5-large"
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL_DEFAULT = "llama-3.3-70b-versatile"
 
-st.set_page_config(page_title="RAG Chat — Final v2", layout="wide")
+st.set_page_config(page_title="RAG Chat — Final", layout="wide")
 
 # -------------------------
 # Tokens (secrets -> env -> fallback)
