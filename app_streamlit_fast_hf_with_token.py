@@ -685,4 +685,4 @@ with col2:
         st.write(mem)
 
     st.markdown("---")
-    st.caption("Notes: If embedding computation fails, set HF_API_TOKEN in Streamlit Secrets (or install sentence-transformers locally). For scanned PDFs, Poppler + Tesseract required on the host for OCR.")
+    # st.caption("Notes: If embedding computation fails, set HF_API_TOKEN in Streamlit Secrets (or install sentence-transformers locally). For scanned PDFs, Poppler + Tesseract required on the host for OCR.")
