@@ -844,16 +844,84 @@ def get_local_caption_pipeline_cached(model_name="nlpconnect/vit-gpt2-image-capt
 # -------------------------
 # Chroma client helper
 # -------------------------
+# def make_chroma_client(persist_directory: Optional[str] = None) -> chromadb.Client:
+#     persist_directory = str(persist_directory) if persist_directory else None
+#     candidates = []
+#     if persist_directory:
+#         candidates.append({"persist_directory": persist_directory, "chroma_api_impl": "duckdb+parquet"})
+#         candidates.append({"persist_directory": persist_directory, "chroma_db_impl": "duckdb+parquet"})
+#         candidates.append({"persist_directory": persist_directory})
+#     else:
+#         candidates.append({})
+#     last_exc = None
+#     for cfg in candidates:
+#         try:
+#             settings = Settings(**cfg)
+#             client = chromadb.Client(settings)
+#             _ = client.list_collections()
+#             st.info(f"Chroma client initialized with settings: {list(cfg.keys()) or ['default']}")
+#             return client
+#         except Exception as e:
+#             last_exc = e
+#             continue
+#     try:
+#         client = chromadb.Client()
+#         st.warning("Falling back to in-memory Chroma (no persistence).")
+#         return client
+#     except Exception as e:
+#         raise RuntimeError(f"Could not initialize Chroma client. Last error: {last_exc or e}")
+
+# -------------------------
+# Chroma client helper (cached, safe against multiple instantiations)
+# -------------------------
+@st.cache_resource
 def make_chroma_client(persist_directory: Optional[str] = None) -> chromadb.Client:
+    """
+    Return a chromadb.Client. This function is cached by Streamlit so repeated calls
+    with the same persist_directory return the same client instance (and same settings).
+    If creation with the preferred settings fails due to an existing instance with
+    different settings, fall back to a plain chromadb.Client().
+    """
     persist_directory = str(persist_directory) if persist_directory else None
+
+    # Build a single settings dict to try first
+    try_settings = {}
+    if persist_directory:
+        # prefer the explicit duckdb+parquet setting for persistent indexes
+        try_settings = {"persist_directory": persist_directory, "chroma_api_impl": "duckdb+parquet"}
+    else:
+        try_settings = {}
+
+    last_exc = None
+    # Try to create client with our preferred settings first
+    try:
+        settings = Settings(**try_settings) if try_settings else Settings()
+        client = chromadb.Client(settings)
+        # quick sanity call to verify it's usable
+        _ = client.list_collections()
+        st.info(f"Chroma client initialized with settings: {list(try_settings.keys()) or ['default']}")
+        return client
+    except Exception as e:
+        last_exc = e
+        # If the error message looks like "An instance of Chroma already exists..."
+        # attempt to fall back to a default client (in-memory) to avoid crashing.
+        err_msg = str(e).lower()
+        if "an instance of chroma already exists" in err_msg or "already exists for" in err_msg:
+            try:
+                client = chromadb.Client()
+                st.warning("Detected existing Chroma instance with different settings — falling back to default/in-memory client.")
+                return client
+            except Exception as e2:
+                last_exc = e2
+
+    # As a last attempt, try other candidate configs (older chroma variants)
     candidates = []
     if persist_directory:
-        candidates.append({"persist_directory": persist_directory, "chroma_api_impl": "duckdb+parquet"})
         candidates.append({"persist_directory": persist_directory, "chroma_db_impl": "duckdb+parquet"})
         candidates.append({"persist_directory": persist_directory})
     else:
         candidates.append({})
-    last_exc = None
+
     for cfg in candidates:
         try:
             settings = Settings(**cfg)
@@ -864,12 +932,15 @@ def make_chroma_client(persist_directory: Optional[str] = None) -> chromadb.Clie
         except Exception as e:
             last_exc = e
             continue
+
+    # Final fallback: attempt plain client again and surface a clear error if it fails
     try:
         client = chromadb.Client()
-        st.warning("Falling back to in-memory Chroma (no persistence).")
+        st.warning("Falling back to plain chromadb.Client() (in-memory).")
         return client
     except Exception as e:
         raise RuntimeError(f"Could not initialize Chroma client. Last error: {last_exc or e}")
+
 
 # -------------------------
 # Utilities
