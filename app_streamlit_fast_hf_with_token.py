@@ -848,48 +848,63 @@ from typing import Optional
 # FIXED Chroma client helper (final)
 # -------------------------
 
+# @st.cache_resource
+# def make_chroma_client(persist_directory: Optional[str] = None) -> chromadb.Client:
+#     """
+#     Prevents the 'An instance of Chroma already exists' error by:
+#     - Normalizing the persist path.
+#     - Caching the client per path.
+#     - Falling back to in-memory Chroma when settings conflict.
+#     """
+#     # Normalize persist path
+#     persist_directory = os.path.abspath(str(persist_directory)) if persist_directory else None
+
+#     # Preferred settings
+#     try_settings = {"persist_directory": persist_directory, "chroma_api_impl": "duckdb+parquet"} if persist_directory else {}
+
+#     # Attempt preferred settings
+#     try:
+#         settings = Settings(**try_settings) if try_settings else Settings()
+#         client = chromadb.Client(settings)
+#         client.list_collections()
+#         st.info(f"Chroma initialized with settings: {try_settings or 'default'}")
+#         return client
+#     except Exception as e:
+#         err = str(e).lower()
+
+#         # ↓↓↓↓↓ THIS IS THE CRITICAL FIX ↓↓↓↓↓
+#         if "already exists" in err or "different settings" in err:
+#             st.warning("Chroma instance conflict detected → using in-memory Chroma instead.")
+#             try:
+#                 client = chromadb.Client()
+#                 client.list_collections()
+#                 return client
+#             except Exception as e2:
+#                 raise RuntimeError(f"Fallback to in-memory Chroma failed: {e2}") from e
+
+#     # Final fallback
+#     try:
+#         client = chromadb.Client()
+#         client.list_collections()
+#         st.warning("Using plain in-memory Chroma.")
+#         return client
+#     except Exception as e:
+#         raise RuntimeError(f"Could not initialize Chroma client: {e}")
 @st.cache_resource
 def make_chroma_client(persist_directory: Optional[str] = None) -> chromadb.Client:
     """
-    Prevents the 'An instance of Chroma already exists' error by:
-    - Normalizing the persist path.
-    - Caching the client per path.
-    - Falling back to in-memory Chroma when settings conflict.
+    Force a plain in-memory Chroma client (recommended for Streamlit Cloud).
+    Keeps behavior deterministic and avoids 'already exists / different settings' errors.
     """
-    # Normalize persist path
-    persist_directory = os.path.abspath(str(persist_directory)) if persist_directory else None
-
-    # Preferred settings
-    try_settings = {"persist_directory": persist_directory, "chroma_api_impl": "duckdb+parquet"} if persist_directory else {}
-
-    # Attempt preferred settings
     try:
-        settings = Settings(**try_settings) if try_settings else Settings()
-        client = chromadb.Client(settings)
-        client.list_collections()
-        st.info(f"Chroma initialized with settings: {try_settings or 'default'}")
-        return client
-    except Exception as e:
-        err = str(e).lower()
-
-        # ↓↓↓↓↓ THIS IS THE CRITICAL FIX ↓↓↓↓↓
-        if "already exists" in err or "different settings" in err:
-            st.warning("Chroma instance conflict detected → using in-memory Chroma instead.")
-            try:
-                client = chromadb.Client()
-                client.list_collections()
-                return client
-            except Exception as e2:
-                raise RuntimeError(f"Fallback to in-memory Chroma failed: {e2}") from e
-
-    # Final fallback
-    try:
+        # plain client -> no Settings passed (in-memory)
         client = chromadb.Client()
+        # sanity call
         client.list_collections()
-        st.warning("Using plain in-memory Chroma.")
+        st.info("Using plain in-memory Chroma (no persistence).")
         return client
     except Exception as e:
-        raise RuntimeError(f"Could not initialize Chroma client: {e}")
+        raise RuntimeError(f"Could not initialize in-memory Chroma: {e}")
 
 # -------------------------
 # Utilities
@@ -1236,7 +1251,9 @@ def build_chroma_from_uploads(uploaded_files: List[st.runtime.uploaded_file_mana
 
     try:
         # client = make_chroma_client(persist_directory=persist_dir_path)
-        client = make_chroma_client(os.path.abspath(str(persist_dir)))
+        # client = make_chroma_client(os.path.abspath(str(persist_dir)))
+        client = make_chroma_client(None)
+
 
     except Exception as e:
         st.error(f"Chroma init error: {e}")
