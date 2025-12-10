@@ -841,35 +841,9 @@ def get_local_caption_pipeline_cached(model_name="nlpconnect/vit-gpt2-image-capt
         raise RuntimeError("transformers not installed on server.")
     return pipeline("image-to-text", model=model_name, device=-1)
 
-# -------------------------
-# Chroma client helper
-# -------------------------
-# def make_chroma_client(persist_directory: Optional[str] = None) -> chromadb.Client:
-#     persist_directory = str(persist_directory) if persist_directory else None
-#     candidates = []
-#     if persist_directory:
-#         candidates.append({"persist_directory": persist_directory, "chroma_api_impl": "duckdb+parquet"})
-#         candidates.append({"persist_directory": persist_directory, "chroma_db_impl": "duckdb+parquet"})
-#         candidates.append({"persist_directory": persist_directory})
-#     else:
-#         candidates.append({})
-#     last_exc = None
-#     for cfg in candidates:
-#         try:
-#             settings = Settings(**cfg)
-#             client = chromadb.Client(settings)
-#             _ = client.list_collections()
-#             st.info(f"Chroma client initialized with settings: {list(cfg.keys()) or ['default']}")
-#             return client
-#         except Exception as e:
-#             last_exc = e
-#             continue
-#     try:
-#         client = chromadb.Client()
-#         st.warning("Falling back to in-memory Chroma (no persistence).")
-#         return client
-#     except Exception as e:
-#         raise RuntimeError(f"Could not initialize Chroma client. Last error: {last_exc or e}")
+import os
+import shutil
+from typing import Optional
 
 # -------------------------
 # Chroma client helper (cached, safe against multiple instantiations)
@@ -882,30 +856,28 @@ def make_chroma_client(persist_directory: Optional[str] = None) -> chromadb.Clie
     If creation with the preferred settings fails due to an existing instance with
     different settings, fall back to a plain chromadb.Client().
     """
-    persist_directory = str(persist_directory) if persist_directory else None
+    # Normalize persist directory to an absolute path (or None)
+    persist_directory = os.path.abspath(str(persist_directory)) if persist_directory else None
 
-    # Build a single settings dict to try first
+    # Preferred settings to try first
     try_settings = {}
     if persist_directory:
-        # prefer the explicit duckdb+parquet setting for persistent indexes
         try_settings = {"persist_directory": persist_directory, "chroma_api_impl": "duckdb+parquet"}
     else:
         try_settings = {}
 
     last_exc = None
-    # Try to create client with our preferred settings first
+    # Try preferred settings first
     try:
         settings = Settings(**try_settings) if try_settings else Settings()
         client = chromadb.Client(settings)
-        # quick sanity call to verify it's usable
         _ = client.list_collections()
         st.info(f"Chroma client initialized with settings: {list(try_settings.keys()) or ['default']}")
         return client
     except Exception as e:
         last_exc = e
-        # If the error message looks like "An instance of Chroma already exists..."
-        # attempt to fall back to a default client (in-memory) to avoid crashing.
         err_msg = str(e).lower()
+        # If conflict due to an existing instance, fallback to plain client
         if "an instance of chroma already exists" in err_msg or "already exists for" in err_msg:
             try:
                 client = chromadb.Client()
@@ -914,7 +886,7 @@ def make_chroma_client(persist_directory: Optional[str] = None) -> chromadb.Clie
             except Exception as e2:
                 last_exc = e2
 
-    # As a last attempt, try other candidate configs (older chroma variants)
+    # Try other candidate configs (compat with different chroma versions)
     candidates = []
     if persist_directory:
         candidates.append({"persist_directory": persist_directory, "chroma_db_impl": "duckdb+parquet"})
@@ -933,14 +905,13 @@ def make_chroma_client(persist_directory: Optional[str] = None) -> chromadb.Clie
             last_exc = e
             continue
 
-    # Final fallback: attempt plain client again and surface a clear error if it fails
+    # Final fallback: plain client (in-memory)
     try:
         client = chromadb.Client()
         st.warning("Falling back to plain chromadb.Client() (in-memory).")
         return client
     except Exception as e:
         raise RuntimeError(f"Could not initialize Chroma client. Last error: {last_exc or e}")
-
 
 # -------------------------
 # Utilities
@@ -1150,17 +1121,147 @@ def embed_texts_resilient(texts: List[str], candidate_models: List[str]) -> List
 # -------------------------
 # Build Chroma from uploads
 # -------------------------
+# def build_chroma_from_uploads(uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile], candidate_embed_models: List[str], max_chunks: Optional[int] = None):
+#     if not uploaded_files:
+#         return None
+#     fp = fingerprint_files(uploaded_files)
+#     persist_dir = TMP_BASE / fp
+#     persist_dir.mkdir(parents=True, exist_ok=True)
+#     try:
+#         client = make_chroma_client(str(persist_dir))
+#     except Exception as e:
+#         st.error(f"Chroma init error: {e}")
+#         return None
+#     try:
+#         try:
+#             col = client.get_collection(name=f"col_{fp}")
+#         except Exception:
+#             col = client.create_collection(name=f"col_{fp}")
+#     except Exception as e:
+#         st.error(f"Chroma collection error: {e}")
+#         return None
+
+#     try:
+#         if col.count() and col.count() > 0:
+#             st.success(f"Collection already indexed with {col.count()} items.")
+#             return {"collection": col, "persist_dir": str(persist_dir), "indexed_chunks": col.count(), "snippets": []}
+#     except Exception:
+#         pass
+
+#     texts = []
+#     ids = []
+#     metadatas = []
+#     snippets = []
+
+#     for uploaded in uploaded_files:
+#         try:
+#             size = getattr(uploaded, "size", None) or len(uploaded.getbuffer())
+#         except Exception:
+#             size = 0
+#         if size > MAX_UPLOAD_MB * 1024 * 1024:
+#             st.warning(f"Skipping {uploaded.name} (> {MAX_UPLOAD_MB}MB)")
+#             continue
+#         data = uploaded.getbuffer().tobytes()
+#         file_text = ""
+#         if uploaded.name.lower().endswith(".pdf"):
+#             file_text = extract_text_from_pdf_bytes(data)
+#         else:
+#             try:
+#                 file_text = data.decode("utf-8", errors="ignore")
+#             except Exception:
+#                 try:
+#                     file_text = data.decode("latin-1", errors="ignore")
+#                 except Exception:
+#                     file_text = ""
+#         if not file_text or not file_text.strip():
+#             st.info(f"No text extracted from {uploaded.name}; skipping.")
+#             continue
+#         chunks = chunk_text(file_text)
+#         for i, c in enumerate(chunks):
+#             uid = f"{uploaded.name}__{i}"
+#             ids.append(uid)
+#             texts.append(c)
+#             metadatas.append({"source": uploaded.name, "chunk": i})
+#             snippets.append({"name": uploaded.name, "preview": c[:200]})
+
+#     if not texts:
+#         st.warning("No text extracted to index.")
+#         return None
+
+#     if max_chunks and len(texts) > max_chunks:
+#         texts = texts[:max_chunks]
+#         ids = ids[:max_chunks]
+#         metadatas = metadatas[:max_chunks]
+
+#     # compute embeddings
+#     try:
+#         embeddings = []
+#         progress = st.progress(0)
+#         total = len(texts)
+#         for i in range(0, total, BATCH_SIZE):
+#             batch = texts[i : i + BATCH_SIZE]
+#             ev = embed_texts_resilient(batch, candidate_embed_models)
+#             embeddings.extend(ev)
+#             progress.progress(min(100, int(100 * (i + len(batch)) / total)))
+#         progress.empty()
+#     except Exception as e:
+#         st.error(f"Embedding computation failed: {e}")
+#         return None
+
+#     try:
+#         # validate embedding dims
+#         if embeddings:
+#             dim = len(embeddings[0])
+#             if any(len(e) != dim for e in embeddings):
+#                 st.error("Embedding dimension mismatch (some embeddings have different sizes). Aborting indexing.")
+#                 return None
+#         col.add(documents=texts, metadatas=metadatas, ids=ids, embeddings=embeddings)
+#         try:
+#             client.persist()
+#         except Exception:
+#             st.info("client.persist() unsupported or failed in this environment (using in-memory/partial persist).")
+#         return {"collection": col, "persist_dir": str(persist_dir), "indexed_chunks": len(texts), "snippets": snippets}
+#     except Exception as e:
+#         st.error(f"Failed to save to Chroma: {e}")
+#         return None
+
 def build_chroma_from_uploads(uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile], candidate_embed_models: List[str], max_chunks: Optional[int] = None):
     if not uploaded_files:
         return None
+
     fp = fingerprint_files(uploaded_files)
     persist_dir = TMP_BASE / fp
-    persist_dir.mkdir(parents=True, exist_ok=True)
+    persist_dir_path = os.path.abspath(str(persist_dir))
+    marker_file = os.path.join(persist_dir_path, ".index_fp")
+
+    # If the persist_dir exists but marker file differs, remove the directory to avoid stale index reuse
     try:
-        client = make_chroma_client(str(persist_dir))
+        if os.path.isdir(persist_dir_path):
+            try:
+                with open(marker_file, "r") as f:
+                    existing_fp = f.read().strip()
+            except Exception:
+                existing_fp = None
+            if existing_fp and existing_fp != fp:
+                # Old index belongs to different files — delete and recreate
+                try:
+                    shutil.rmtree(persist_dir_path)
+                    st.info("Removed stale index directory (fingerprint mismatch). Recreating index.")
+                except Exception as e:
+                    st.warning(f"Could not remove stale persist dir: {e}. Attempting to continue.")
+    except Exception:
+        # ignore and proceed to ensure directory exists
+        pass
+
+    # ensure persist dir exists
+    os.makedirs(persist_dir_path, exist_ok=True)
+
+    try:
+        client = make_chroma_client(persist_directory=persist_dir_path)
     except Exception as e:
         st.error(f"Chroma init error: {e}")
         return None
+
     try:
         try:
             col = client.get_collection(name=f"col_{fp}")
@@ -1170,10 +1271,17 @@ def build_chroma_from_uploads(uploaded_files: List[st.runtime.uploaded_file_mana
         st.error(f"Chroma collection error: {e}")
         return None
 
+    # If collection already has entries and was created earlier for this fingerprint, return early
     try:
         if col.count() and col.count() > 0:
             st.success(f"Collection already indexed with {col.count()} items.")
-            return {"collection": col, "persist_dir": str(persist_dir), "indexed_chunks": col.count(), "snippets": []}
+            # ensure marker file exists (write it)
+            try:
+                with open(marker_file, "w") as f:
+                    f.write(fp)
+            except Exception:
+                pass
+            return {"collection": col, "persist_dir": persist_dir_path, "indexed_chunks": col.count(), "snippets": []}
     except Exception:
         pass
 
@@ -1249,10 +1357,17 @@ def build_chroma_from_uploads(uploaded_files: List[st.runtime.uploaded_file_mana
             client.persist()
         except Exception:
             st.info("client.persist() unsupported or failed in this environment (using in-memory/partial persist).")
-        return {"collection": col, "persist_dir": str(persist_dir), "indexed_chunks": len(texts), "snippets": snippets}
+        # write marker file to record the fingerprint used for this persist directory
+        try:
+            with open(marker_file, "w") as f:
+                f.write(fp)
+        except Exception:
+            pass
+        return {"collection": col, "persist_dir": persist_dir_path, "indexed_chunks": len(texts), "snippets": snippets}
     except Exception as e:
         st.error(f"Failed to save to Chroma: {e}")
         return None
+
 
 # -------------------------
 # Query helper
