@@ -757,7 +757,8 @@ except Exception:
 # NOTE: These were provided in your message. They are embedded here per your request.
 GROQ_KEY_FALLBACK = "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"
 # HF_KEY_FALLBACK = "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"
-HF_KEY_FALLBACK = "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"
+# HF_KEY_FALLBACK = "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"
+HF_KEY_FALLBACK = "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"
 
 # -------------------------
 # Live API KEYS (user provided)
