@@ -58,8 +58,8 @@ except Exception:
 # FALLBACK KEYS (user provided)
 # -------------------------
 GROQ_KEY_FALLBACK = "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"
-HF_KEY_FALLBACK = "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"
-
+# HF_KEY_FALLBACK = "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"
+HF_KEY_FALLBACK = "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"
 # -------------------------
 # CONFIG
 # -------------------------
